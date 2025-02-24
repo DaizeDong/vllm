@@ -1,0 +1,3 @@
+[submodule "vllm/basic_utils"]
+	path = vllm/basic_utils
+	url = https://github.com/DaizeDong/BasicUtils

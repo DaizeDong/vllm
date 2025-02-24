@@ -11,11 +11,14 @@ import triton.language as tl
 
 import vllm.envs as envs
 from vllm import _custom_ops as ops
+from vllm.analysis_utils import ANALYSIS_CACHE_DYNAMIC
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     per_token_group_quant_fp8)
 from vllm.platforms import current_platform
 from vllm.utils import direct_register_custom_op
+
+from vllm.analysis_utils.analysis_env import ANALYSIS_ENABLED, ANALYSIS_TYPE
 
 logger = init_logger(__name__)
 
@@ -880,11 +883,36 @@ def try_get_optimal_moe_config(
     return config
 
 
+def switch_load_balancing_loss_func(
+    probs: torch.Tensor, tokens_per_expert: torch.Tensor, topk: int, moe_aux_loss_coeff: float
+):
+    """Calculate the auxiliary loss for better load balacing.
+    Please refer to the Switch Transformer paper (https://arxiv.org/abs/2101.03961) for details.
+
+    Args:
+        probs (torch.Tensor): The softmax probs output by the router for each token. [num_tokens, num_experts]
+        tokens_per_expert (torch.Tensor): The number of assigned tokens for each expert. [num_experts]
+
+    Returns:
+        torch.Tensor: The auxiliary loss for load balancing.
+    """
+    num_sub_seq = 1
+
+    num_tokens = probs.shape[0] * topk * num_sub_seq
+    num_experts = probs.shape[1]
+
+    probs = torch.nn.functional.normalize(probs, p=1, dim=-1)
+    probs_mean_per_expert = probs.clone().float().mean(dim=0)
+    aux_loss = torch.sum(probs_mean_per_expert * tokens_per_expert.clone().float()) * (num_experts / num_tokens * moe_aux_loss_coeff)
+    return aux_loss
+
+
 def fused_topk(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
     topk: int,
     renormalize: bool,
+    layer_idx: Optional[int] = None,  # 🔍
 ):
     assert hidden_states.shape[0] == gating_output.shape[0], (
         "Number of tokens mismatch")
@@ -914,6 +942,28 @@ def fused_topk(
 
     if renormalize:
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+
+    if ANALYSIS_ENABLED and "balance_loss" in ANALYSIS_TYPE and ANALYSIS_CACHE_DYNAMIC[-1] is not None and layer_idx is not None:  # 🔍
+        scores = torch.softmax(gating_output, dim=-1)
+        balance_loss = switch_load_balancing_loss_func(
+            scores,
+            torch.zeros_like(scores).scatter(1, topk_ids, 1),
+            topk,
+            moe_aux_loss_coeff=1.0,
+        )
+        if "balance_loss" not in ANALYSIS_CACHE_DYNAMIC[-1]:
+            ANALYSIS_CACHE_DYNAMIC[-1]["balance_loss"] = {}
+        ANALYSIS_CACHE_DYNAMIC[-1]["balance_loss"][layer_idx] = balance_loss.clone().cpu()
+
+    if ANALYSIS_ENABLED and "router_scores" in ANALYSIS_TYPE and ANALYSIS_CACHE_DYNAMIC[-1] is not None and layer_idx is not None:  # 🔍
+        if "router_scores" not in ANALYSIS_CACHE_DYNAMIC[-1]:
+            ANALYSIS_CACHE_DYNAMIC[-1]["router_scores"] = {}
+        ANALYSIS_CACHE_DYNAMIC[-1]["router_scores"][layer_idx] = {
+            "logits": gating_output.clone().cpu(),
+            "scores": torch.softmax(gating_output, dim=-1).clone().cpu(),
+            "topk_scores": topk_weights.clone().cpu(),
+            "topk_ids": topk_ids.clone().cpu(),
+        }
 
     return topk_weights, topk_ids
 
@@ -972,6 +1022,27 @@ def grouped_topk(hidden_states: torch.Tensor,
 
     if renormalize:
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+
+    if ANALYSIS_ENABLED and "balance_loss" in ANALYSIS_TYPE and ANALYSIS_CACHE_DYNAMIC[-1] is not None and layer_idx is not None:  # 🔍
+        balance_loss = switch_load_balancing_loss_func(
+            scores,
+            torch.zeros_like(scores).scatter(1, topk_ids, 1),
+            topk,
+            moe_aux_loss_coeff=1.0,
+        )
+        if "balance_loss" not in ANALYSIS_CACHE_DYNAMIC[-1]:
+            ANALYSIS_CACHE_DYNAMIC[-1]["balance_loss"] = {}
+        ANALYSIS_CACHE_DYNAMIC[-1]["balance_loss"][layer_idx] = balance_loss.clone().cpu()
+
+    if ANALYSIS_ENABLED and "router_scores" in ANALYSIS_TYPE and ANALYSIS_CACHE_DYNAMIC[-1] is not None and layer_idx is not None:  # 🔍
+        if "router_scores" not in ANALYSIS_CACHE_DYNAMIC[-1]:
+            ANALYSIS_CACHE_DYNAMIC[-1]["router_scores"] = {}
+        ANALYSIS_CACHE_DYNAMIC[-1]["router_scores"][layer_idx] = {
+            "logits": gating_output.clone().cpu(),
+            "scores": scores.clone().cpu(),
+            "topk_scores": topk_weights.clone().cpu(),
+            "topk_ids": topk_ids.clone().cpu(),
+        }
 
     return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
 
@@ -1293,6 +1364,7 @@ def fused_moe(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[List[int]] = None,
+    layer_idx: Optional[int] = None,  # 🔍
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -1341,10 +1413,12 @@ def fused_moe(
         assert num_expert_group is not None and topk_group is not None
         topk_weights, topk_ids = grouped_topk(hidden_states, gating_output,
                                               topk, renormalize,
-                                              num_expert_group, topk_group)
+                                              num_expert_group, topk_group,
+                                              layer_idx=layer_idx)  # 🔍
     elif custom_routing_function is None:
         topk_weights, topk_ids = fused_topk(hidden_states, gating_output, topk,
-                                            renormalize)
+                                            renormalize,
+                                            layer_idx=layer_idx)  # 🔍
     else:
         topk_weights, topk_ids = custom_routing_function(
             hidden_states, gating_output, topk, renormalize)

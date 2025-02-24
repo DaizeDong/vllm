@@ -115,7 +115,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         num_expert_group: Optional[int] = None,
         custom_routing_function: Optional[Callable] = None,
         scoring_func: str = "softmax",
-        e_score_correction_bias: Optional[torch.Tensor] = None
+        e_score_correction_bias: Optional[torch.Tensor] = None,
+        layer_idx: Optional[int] = None,  # 🔍
     ) -> torch.Tensor:
         return self.forward(x=x,
                             layer=layer,
@@ -127,7 +128,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                             num_expert_group=num_expert_group,
                             custom_routing_function=custom_routing_function,
                             scoring_func=scoring_func,
-                            e_score_correction_bias=e_score_correction_bias)
+                            e_score_correction_bias=e_score_correction_bias,
+                            layer_idx=layer_idx)  # 🔍
 
     def forward_cuda(
         self,
@@ -141,7 +143,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         num_expert_group: Optional[int] = None,
         custom_routing_function: Optional[Callable] = None,
         scoring_func: str = "softmax",
-        e_score_correction_bias: Optional[torch.Tensor] = None
+        e_score_correction_bias: Optional[torch.Tensor] = None,
+        layer_idx: Optional[int] = None,  # 🔍
     ) -> torch.Tensor:
         topk_weights, topk_ids = FusedMoE.select_experts(
             hidden_states=x,
@@ -153,7 +156,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             num_expert_group=num_expert_group,
             custom_routing_function=custom_routing_function,
             scoring_func=scoring_func,
-            e_score_correction_bias=e_score_correction_bias)
+            e_score_correction_bias=e_score_correction_bias,
+            layer_idx=layer_idx)  # 🔍
+
 
         return fused_experts(hidden_states=x,
                              w1=layer.w13_weight,
@@ -259,12 +264,14 @@ class FusedMoE(torch.nn.Module):
         custom_routing_function: Optional[Callable] = None,
         scoring_func: str = "softmax",
         e_score_correction_bias: Optional[torch.Tensor] = None,
+        layer_idx: Optional[int] = None,  # 🔍
     ):
         super().__init__()
 
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
 
+        self.layer_idx = layer_idx  # 🔍
         self.tp_size = (tp_size if tp_size is not None else
                         get_tensor_model_parallel_world_size())
         self.top_k = top_k
@@ -547,7 +554,9 @@ class FusedMoE(torch.nn.Module):
                        num_expert_group: Optional[int] = None,
                        custom_routing_function: Optional[Callable] = None,
                        scoring_func: str = "softmax",
-                       e_score_correction_bias: Optional[torch.Tensor] = None):
+                       e_score_correction_bias: Optional[torch.Tensor] = None,
+                       layer_idx: Optional[int] = None,  # 🔍
+                       ):
         from vllm.model_executor.layers.fused_moe.fused_moe import (
             fused_topk, grouped_topk)
 
@@ -563,7 +572,8 @@ class FusedMoE(torch.nn.Module):
                 num_expert_group=num_expert_group,
                 topk_group=topk_group,
                 scoring_func=scoring_func,
-                e_score_correction_bias=e_score_correction_bias)
+                e_score_correction_bias=e_score_correction_bias,
+                layer_idx=layer_idx)  # 🔍
         elif custom_routing_function is None:
             topk_weights, topk_ids = fused_topk(hidden_states=hidden_states,
                                                 gating_output=router_logits,
@@ -574,7 +584,8 @@ class FusedMoE(torch.nn.Module):
                 hidden_states=hidden_states,
                 gating_output=router_logits,
                 topk=top_k,
-                renormalize=renormalize)
+                renormalize=renormalize,
+                layer_idx=layer_idx)  # 🔍
 
         return topk_weights, topk_ids
 
@@ -594,7 +605,8 @@ class FusedMoE(torch.nn.Module):
             num_expert_group=self.num_expert_group,
             custom_routing_function=self.custom_routing_function,
             scoring_func=self.scoring_func,
-            e_score_correction_bias=self.e_score_correction_bias)
+            e_score_correction_bias=self.e_score_correction_bias,
+            layer_idx=self.layer_idx)  # 🔍
 
         if self.reduce_results and self.tp_size > 1:
             final_hidden_states = tensor_model_parallel_all_reduce(

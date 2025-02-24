@@ -16,6 +16,7 @@ import torch
 from typing_extensions import TypeVar, deprecated
 
 import vllm.envs as envs
+from vllm.analysis_utils.analysis_cache import save_analysis_cache
 from vllm.config import (DecodingConfig, LoRAConfig, ModelConfig,
                          ObservabilityConfig, ParallelConfig, SchedulerConfig,
                          VllmConfig)
@@ -1461,6 +1462,13 @@ class LLMEngine:
             # queued control plane messages, such as add/remove lora adapters.
             logger.debug("Stopping remote worker execution loop.")
             self.model_executor.stop_remote_worker_execution_loop()
+
+        if self.parallel_config.world_size == 1: # save for DP
+            # This world_size denotes the TP size
+            # When using TP, each forward will call this `step` function, where the cache shouldn't be saved
+            # (Maybe) When using DP, this `step` function will be called only once, where the cache can be saved safely
+            print("parallel_config", self.parallel_config.__dict__)
+            save_analysis_cache()
 
         return ctx.request_outputs
 
