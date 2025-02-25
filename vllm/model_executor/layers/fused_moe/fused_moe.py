@@ -977,8 +977,9 @@ def grouped_topk(hidden_states: torch.Tensor,
                  num_expert_group: int = 0,
                  topk_group: int = 0,
                  scoring_func: str = "softmax",
-                 e_score_correction_bias: Optional[torch.Tensor] = None):
-
+                 e_score_correction_bias: Optional[torch.Tensor] = None,
+                 layer_idx: Optional[int] = None,  # 🔍
+                 ):
     assert hidden_states.shape[0] == gating_output.shape[0], (
         "Number of tokens mismatch")
 
