@@ -16,7 +16,6 @@ import torch
 from typing_extensions import TypeVar, deprecated
 
 import vllm.envs as envs
-from vllm.analysis_utils.analysis_cache import save_analysis_cache
 from vllm.config import (DecodingConfig, LoRAConfig, ModelConfig,
                          ObservabilityConfig, ParallelConfig, SchedulerConfig,
                          VllmConfig)
@@ -61,6 +60,15 @@ from vllm.usage.usage_lib import (UsageContext, is_usage_stats_enabled,
 from vllm.utils import (Counter, Device, deprecate_kwargs,
                         resolve_obj_by_qualname, weak_bind)
 from vllm.version import __version__ as VLLM_VERSION
+
+try:  # 🔍
+    import analysis_utils
+    from analysis_utils import save_analysis_cache
+
+    ANALYSIS_MODULE_LOADED = True
+
+except Exception as e:
+    ANALYSIS_MODULE_LOADED = False
 
 logger = init_logger(__name__)
 _LOCAL_LOGGING_INTERVAL_SEC = 5
@@ -1463,7 +1471,7 @@ class LLMEngine:
             logger.debug("Stopping remote worker execution loop.")
             self.model_executor.stop_remote_worker_execution_loop()
 
-        if self.parallel_config.world_size == 1: # save for DP
+        if ANALYSIS_MODULE_LOADED and self.parallel_config.world_size == 1:  # 🔍 save for DP
             # This world_size denotes the TP size
             # When using TP, each forward will call this `step` function, where the cache shouldn't be saved
             # (Maybe) When using DP, this `step` function will be called only once, where the cache can be saved safely

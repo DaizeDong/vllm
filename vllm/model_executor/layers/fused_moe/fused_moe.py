@@ -11,14 +11,20 @@ import triton.language as tl
 
 import vllm.envs as envs
 from vllm import _custom_ops as ops
-from vllm.analysis_utils import ANALYSIS_CACHE_DYNAMIC
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     per_token_group_quant_fp8)
 from vllm.platforms import current_platform
 from vllm.utils import direct_register_custom_op
 
-from vllm.analysis_utils.analysis_env import ANALYSIS_ENABLED, ANALYSIS_TYPE
+try:  # 🔍
+    import analysis_utils
+    from analysis_utils import ANALYSIS_ENABLED, ANALYSIS_TYPE, ANALYSIS_CACHE_DYNAMIC
+
+    ANALYSIS_MODULE_LOADED = True
+
+except Exception as e:
+    ANALYSIS_MODULE_LOADED = False
 
 logger = init_logger(__name__)
 
@@ -985,7 +991,7 @@ def fused_topk(
     if renormalize:
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
 
-    if ANALYSIS_ENABLED and "balance_loss" in ANALYSIS_TYPE and ANALYSIS_CACHE_DYNAMIC[-1] is not None and layer_idx is not None:  # 🔍
+    if ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED and "balance_loss" in ANALYSIS_TYPE and ANALYSIS_CACHE_DYNAMIC[-1] is not None and layer_idx is not None:  # 🔍
         scores = torch.softmax(gating_output, dim=-1)
         balance_loss = switch_load_balancing_loss_func(
             scores,
@@ -997,7 +1003,7 @@ def fused_topk(
             ANALYSIS_CACHE_DYNAMIC[-1]["balance_loss"] = {}
         ANALYSIS_CACHE_DYNAMIC[-1]["balance_loss"][layer_idx] = balance_loss.clone().cpu()
 
-    if ANALYSIS_ENABLED and "router_scores" in ANALYSIS_TYPE and ANALYSIS_CACHE_DYNAMIC[-1] is not None and layer_idx is not None:  # 🔍
+    if ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED and "router_scores" in ANALYSIS_TYPE and ANALYSIS_CACHE_DYNAMIC[-1] is not None and layer_idx is not None:  # 🔍
         if "router_scores" not in ANALYSIS_CACHE_DYNAMIC[-1]:
             ANALYSIS_CACHE_DYNAMIC[-1]["router_scores"] = {}
         ANALYSIS_CACHE_DYNAMIC[-1]["router_scores"][layer_idx] = {
@@ -1066,7 +1072,7 @@ def grouped_topk(hidden_states: torch.Tensor,
     if renormalize:
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
 
-    if ANALYSIS_ENABLED and "balance_loss" in ANALYSIS_TYPE and ANALYSIS_CACHE_DYNAMIC[-1] is not None and layer_idx is not None:  # 🔍
+    if ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED and "balance_loss" in ANALYSIS_TYPE and ANALYSIS_CACHE_DYNAMIC[-1] is not None and layer_idx is not None:  # 🔍
         balance_loss = switch_load_balancing_loss_func(
             scores,
             torch.zeros_like(scores).scatter(1, topk_ids, 1),
@@ -1077,7 +1083,7 @@ def grouped_topk(hidden_states: torch.Tensor,
             ANALYSIS_CACHE_DYNAMIC[-1]["balance_loss"] = {}
         ANALYSIS_CACHE_DYNAMIC[-1]["balance_loss"][layer_idx] = balance_loss.clone().cpu()
 
-    if ANALYSIS_ENABLED and "router_scores" in ANALYSIS_TYPE and ANALYSIS_CACHE_DYNAMIC[-1] is not None and layer_idx is not None:  # 🔍
+    if ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED and "router_scores" in ANALYSIS_TYPE and ANALYSIS_CACHE_DYNAMIC[-1] is not None and layer_idx is not None:  # 🔍
         if "router_scores" not in ANALYSIS_CACHE_DYNAMIC[-1]:
             ANALYSIS_CACHE_DYNAMIC[-1]["router_scores"] = {}
         ANALYSIS_CACHE_DYNAMIC[-1]["router_scores"][layer_idx] = {
