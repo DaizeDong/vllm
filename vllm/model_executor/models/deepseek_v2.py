@@ -23,13 +23,13 @@
 # limitations under the License.
 """Inference-only DeepseekV2/DeepseekV3 model."""
 import re
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
+from typing import Any, Dict, Iterable, Optional, Set, Tuple, Union
 
 import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from vllm.attention import Attention, AttentionMetadata
+from vllm.attention import Attention
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, ModelConfig, VllmConfig
 from vllm.distributed import (get_pp_group,
@@ -331,8 +331,6 @@ class DeepseekV2Attention(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        kv_cache: torch.Tensor,
-        attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
         if self.q_lora_rank is not None:
             q = self.q_a_proj(hidden_states)[0]
@@ -365,7 +363,7 @@ class DeepseekV2Attention(nn.Module):
         v = torch.nn.functional.pad(
             v, [0, self.qk_head_dim - self.v_head_dim],
             value=0).view(-1, self.num_local_heads * self.qk_head_dim)
-        attn_output = self.attn(q, k, v, kv_cache, attn_metadata)
+        attn_output = self.attn(q, k, v)
         attn_output = attn_output.view(
             -1, self.num_local_heads,
             self.qk_head_dim)[..., :self.v_head_dim].reshape(
@@ -503,8 +501,6 @@ class DeepseekV2MLAAttention(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        kv_cache: torch.Tensor,
-        attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
         if self.q_lora_rank is not None:
             ckq = self.q_a_proj(hidden_states)[0]
@@ -514,8 +510,7 @@ class DeepseekV2MLAAttention(nn.Module):
         kv_c, k_pe = self.kv_a_proj_with_mqa(hidden_states)[0].split(
             [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         kv_c_normed = self.kv_a_layernorm(kv_c.contiguous())
-        return self.mla_attn(hidden_states_or_q_c, kv_c_normed, k_pe, kv_cache,
-                             attn_metadata)
+        return self.mla_attn(hidden_states_or_q_c, kv_c_normed, k_pe)
 
 
 class DeepseekV2DecoderLayer(nn.Module):
@@ -588,8 +583,6 @@ class DeepseekV2DecoderLayer(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        kv_cache: torch.Tensor,
-        attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor],
     ) -> torch.Tensor:
         # Self Attention
@@ -614,8 +607,6 @@ class DeepseekV2DecoderLayer(nn.Module):
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
-            kv_cache=kv_cache,
-            attn_metadata=attn_metadata,
         )
 
         if ANALYSIS_ENABLED and ANALYSIS_CACHE_DYNAMIC[-1] is not None:  # 🔍
@@ -737,8 +728,6 @@ class DeepseekV2Model(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        kv_caches: List[torch.Tensor],
-        attn_metadata: AttentionMetadata,
         intermediate_tensors: Optional[IntermediateTensors],
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
@@ -757,11 +746,8 @@ class DeepseekV2Model(nn.Module):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
-        for i in range(self.start_layer, self.end_layer):
-            layer = self.layers[i]
-            hidden_states, residual = layer(positions, hidden_states,
-                                            kv_caches[i - self.start_layer],
-                                            attn_metadata, residual)
+        for layer in self.layers[self.start_layer:self.end_layer]:
+            hidden_states, residual = layer(positions, hidden_states, residual)
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({
@@ -783,9 +769,12 @@ class DeepseekV2ForCausalLM(nn.Module, SupportsPP):
         self.quant_config = quant_config
         self.model = DeepseekV2Model(vllm_config=vllm_config,
                                      prefix=maybe_prefix(prefix, "model"))
-        self.lm_head = ParallelLMHead(config.vocab_size,
-                                      config.hidden_size,
-                                      quant_config=quant_config)
+        if get_pp_group().is_last_rank:
+            self.lm_head = ParallelLMHead(config.vocab_size,
+                                          config.hidden_size,
+                                          quant_config=quant_config)
+        else:
+            self.lm_head = PPMissingLayer()
         self.logits_processor = LogitsProcessor(config.vocab_size)
         self.sampler = get_sampler()
         self.make_empty_intermediate_tensors = (
@@ -798,8 +787,6 @@ class DeepseekV2ForCausalLM(nn.Module, SupportsPP):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        kv_caches: List[torch.Tensor],
-        attn_metadata: AttentionMetadata,
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
@@ -809,8 +796,7 @@ class DeepseekV2ForCausalLM(nn.Module, SupportsPP):
             else:
                 ANALYSIS_CACHE_DYNAMIC.append({})
 
-        hidden_states = self.model(input_ids, positions, kv_caches,
-                                   attn_metadata, intermediate_tensors,
+        hidden_states = self.model(input_ids, positions, intermediate_tensors,
                                    inputs_embeds)
 
         # if ANALYSIS_ENABLED:  # 🔍
