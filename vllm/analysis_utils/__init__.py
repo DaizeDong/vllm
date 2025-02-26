@@ -4,7 +4,7 @@ from collections import OrderedDict
 
 from vllm.analysis_utils.analysis_cache import ANALYSIS_CACHE_DYNAMIC, ANALYSIS_CACHE_STATIC
 from vllm.analysis_utils.analysis_env import ANALYSIS_ENABLED, ANALYSIS_SAVE_DIR, ANALYSIS_TYPE
-from vllm.basic_utils.io import save_json
+from vllm.basic_utils.io import create_dir, save_json
 
 # system variables
 try:
@@ -22,6 +22,7 @@ try:
             os.environ['MLP_TASK_ID'] if "MLP_TASK_ID" in os.environ else ".",
             f"run-{runid}-environ-{os.environ['PMIX_NAMESPACE']}" if "PMIX_NAMESPACE" in os.environ else f"run-{runid}-environ",
         )
+        create_dir(save_dir)
         save_json(
             OrderedDict({key: os.environ[key] for key in sorted(os.environ)}),
             os.path.join(save_dir, f"{os.getpid()}.json"),
