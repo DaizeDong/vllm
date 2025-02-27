@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import copy
+import os
 import time
 from collections import Counter as collectionsCounter
 from collections import deque
@@ -64,10 +65,8 @@ from vllm.worker.model_runner_base import InputProcessingError
 
 try:  # 🔍
     import analysis_utils
-    from analysis_utils import save_analysis_cache
-
+    from analysis_utils import save_analysis_cache, PID
     ANALYSIS_MODULE_LOADED = True
-
 except Exception as e:
     ANALYSIS_MODULE_LOADED = False
 
@@ -1329,6 +1328,9 @@ class LLMEngine:
                 "Pipeline parallelism is only supported through AsyncLLMEngine "
                 "as performance will be severely degraded otherwise.")
 
+        if ANALYSIS_MODULE_LOADED:  # 🔍
+            assert self.parallel_config.pipeline_parallel_size == 1, "Analysis is not supported in pipeline parallelism, please set `PP=1`"
+
         # For llm_engine, there is no pipeline parallel support, so the engine
         # used is always 0.
         virtual_engine = 0
@@ -1495,12 +1497,19 @@ class LLMEngine:
             logger.debug("Stopping remote worker execution loop.")
             self.model_executor.stop_remote_worker_execution_loop()
 
-        if ANALYSIS_MODULE_LOADED and self.parallel_config.world_size == 1:  # 🔍 save for DP
-            # This world_size denotes the TP size
-            # When using TP, each forward will call this `step` function, where the cache shouldn't be saved
-            # (Maybe) When using DP, this `step` function will be called only once, where the cache can be saved safely
-            print("parallel_config", self.parallel_config.__dict__)
-            save_analysis_cache()
+        if ANALYSIS_MODULE_LOADED:  # 🔍
+            if "RAY_WORKER_ID" in os.environ:  # 🔍 This process is a subprocess launched by Ray.
+                # This is caused by evaluating using `lm_eval` with `DP>1`, it will launch `DP` vllm workers.
+                # Under this circumstance, the `step` function will be called only once, which means we can safely save the cache.
+                # Each `DP` worker represents `TP*PP` rank 0 and will copy itself into `TP*PP` processes (all with the same PID and rank id 0).
+                # So all the copied processes (totaling `TP*PP`) for each DP rank will enter the `save_analysis_cache` function as they all have `self.parallel_config.rank=0`.
+                print(f"[{PID}] {self.parallel_config.__dict__}")
+                if self.parallel_config.rank % self.parallel_config.world_size == 0:  # world_size = TP * PP
+                    save_analysis_cache()
+                else:
+                    print(f"[{PID}] Skipping analysis cache saving for rank {self.parallel_config.rank}")
+            else:  # 🔍 This process is the main process.
+                pass
 
         return ctx.request_outputs
 

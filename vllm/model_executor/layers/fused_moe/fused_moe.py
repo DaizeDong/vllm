@@ -20,9 +20,7 @@ from vllm.utils import direct_register_custom_op
 try:  # 🔍
     import analysis_utils
     from analysis_utils import ANALYSIS_ENABLED, ANALYSIS_TYPE, ANALYSIS_CACHE_DYNAMIC
-
     ANALYSIS_MODULE_LOADED = True
-
 except Exception as e:
     ANALYSIS_MODULE_LOADED = False
 

@@ -68,9 +68,7 @@ try:  # 🔍
         ANALYSIS_CACHE_BATCH_ID,
         save_analysis_cache_single_batch
     )
-
     ANALYSIS_MODULE_LOADED = True
-
 except Exception as e:
     ANALYSIS_MODULE_LOADED = False
 
