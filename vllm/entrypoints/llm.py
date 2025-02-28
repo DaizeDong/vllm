@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import itertools
+import os
 import warnings
 from contextlib import contextmanager
 from typing import (Any, Callable, ClassVar, Dict, List, Optional, Sequence,
@@ -44,6 +45,13 @@ from vllm.transformers_utils.tokenizer import (AnyTokenizer, MistralTokenizer,
 from vllm.transformers_utils.tokenizer_group import TokenizerGroup
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils import Counter, deprecate_args, deprecate_kwargs, is_list_of
+
+try:  # 🔍
+    import analysis_utils
+    from analysis_utils import save_analysis_cache, PID
+    ANALYSIS_MODULE_LOADED = True
+except Exception as e:
+    ANALYSIS_MODULE_LOADED = False
 
 logger = init_logger(__name__)
 
@@ -1369,6 +1377,9 @@ class LLM:
                          f"output: {0:.2f} toks/s"),
             )
 
+        if ANALYSIS_MODULE_LOADED:  # 🔍
+            assert self.llm_engine.parallel_config.pipeline_parallel_size == 1, "Analysis is not supported in pipeline parallelism, please set `PP=1`"
+
         # Run the engine.
         outputs: List[Union[RequestOutput, PoolingRequestOutput]] = []
         total_in_toks = 0
@@ -1395,6 +1406,22 @@ class LLM:
 
         if use_tqdm:
             pbar.close()
+
+        if ANALYSIS_MODULE_LOADED:  # 🔍
+            if "RAY_JOB_ID" in os.environ:  # 🔍 This process is a subprocess launched by Ray.
+                # This is caused by evaluating using `lm_eval` with `DP>1`, it will launch `DP` vllm workers.
+                # Under this circumstance, the `step` function will be called only once, which means we can safely save the cache.
+                # Each `DP` worker represents `TP*PP` rank 0 and will copy itself into `TP*PP` processes (all with the same PID and rank id 0).
+                # So all the copied processes (totaling `TP*PP`) for each DP rank will enter the `save_analysis_cache` function as they all have `self.parallel_config.rank=0`.
+                print(f"[{PID}] {self.llm_engine.parallel_config.__dict__}")
+                if self.llm_engine.parallel_config.rank % self.llm_engine.parallel_config.world_size == 0:  # world_size = TP * PP
+                    save_analysis_cache()
+                else:
+                    print(f"[{PID}] Skipping analysis cache saving for rank {self.llm_engine.parallel_config.rank}")
+            else:  # 🔍 This process is the main process.
+                print(f"[{PID}] Not a Ray worker, skipping analysis cache saving.")
+                pass
+
         # Sort the outputs by request ID.
         # This is necessary because some requests may be finished earlier than
         # its previous requests.
