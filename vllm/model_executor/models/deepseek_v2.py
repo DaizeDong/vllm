@@ -941,6 +941,14 @@ class DeepseekV2ForCausalLM(nn.Module, SupportsPP):
             for layer_idx, decoder in enumerate(self.model.layers):
                 if isinstance(decoder.mlp, DeepseekV2MoE):
                     ANALYSIS_CACHE_STATIC["router_weights"][layer_idx] = decoder.mlp.gate.__dict__["_parameters"]["weight"].data.clone().cpu()
+
+        if ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED and "router_bias" in ANALYSIS_TYPE:  # 🔍
+            if "router_bias" not in ANALYSIS_CACHE_STATIC:
+                ANALYSIS_CACHE_STATIC["router_bias"] = {}
+            for layer_idx, decoder in enumerate(self.model.layers):
+                if isinstance(decoder.mlp, DeepseekV2MoE) and isinstance(decoder.mlp.gate.e_score_correction_bias, nn.Parameter):
+                    ANALYSIS_CACHE_STATIC["router_bias"][layer_idx] = decoder.mlp.gate.e_score_correction_bias.data.clone().cpu()
+
         return loaded_params
 
 
