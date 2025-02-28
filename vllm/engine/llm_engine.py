@@ -1498,7 +1498,7 @@ class LLMEngine:
             self.model_executor.stop_remote_worker_execution_loop()
 
         if ANALYSIS_MODULE_LOADED:  # 🔍
-            if "RAY_WORKER_ID" in os.environ:  # 🔍 This process is a subprocess launched by Ray.
+            if "RAY_JOB_ID" in os.environ:  # 🔍 This process is a subprocess launched by Ray.
                 # This is caused by evaluating using `lm_eval` with `DP>1`, it will launch `DP` vllm workers.
                 # Under this circumstance, the `step` function will be called only once, which means we can safely save the cache.
                 # Each `DP` worker represents `TP*PP` rank 0 and will copy itself into `TP*PP` processes (all with the same PID and rank id 0).
@@ -1509,6 +1509,7 @@ class LLMEngine:
                 else:
                     print(f"[{PID}] Skipping analysis cache saving for rank {self.parallel_config.rank}")
             else:  # 🔍 This process is the main process.
+                print(f"[{PID}] Not a Ray worker, skipping analysis cache saving.")
                 pass
 
         return ctx.request_outputs
