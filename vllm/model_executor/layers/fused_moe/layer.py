@@ -645,7 +645,8 @@ class FusedMoE(torch.nn.Module):
             topk_weights, topk_ids = fused_topk(hidden_states=hidden_states,
                                                 gating_output=router_logits,
                                                 topk=top_k,
-                                                renormalize=renormalize)
+                                                renormalize=renormalize,
+                                                layer_idx=layer_idx)  # 🔍
         else:
             topk_weights, topk_ids = custom_routing_function(
                 hidden_states=hidden_states,

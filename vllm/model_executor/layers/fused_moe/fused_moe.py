@@ -990,7 +990,7 @@ def fused_topk(
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
 
     if ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED and "balance_loss" in ANALYSIS_TYPE and ANALYSIS_CACHE_DYNAMIC[-1] is not None and layer_idx is not None:  # 🔍
-        scores = torch.softmax(gating_output, dim=-1)
+        scores = torch.softmax(gating_output, dim=-1, dtype=torch.float32)
         balance_loss = switch_load_balancing_loss_func(
             scores,
             torch.zeros_like(scores).scatter(1, topk_ids, 1),
@@ -1002,11 +1002,12 @@ def fused_topk(
         ANALYSIS_CACHE_DYNAMIC[-1]["balance_loss"][layer_idx] = balance_loss.clone().cpu()
 
     if ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED and "router_scores" in ANALYSIS_TYPE and ANALYSIS_CACHE_DYNAMIC[-1] is not None and layer_idx is not None:  # 🔍
+        scores = torch.softmax(gating_output, dim=-1, dtype=torch.float32)
         if "router_scores" not in ANALYSIS_CACHE_DYNAMIC[-1]:
             ANALYSIS_CACHE_DYNAMIC[-1]["router_scores"] = {}
         ANALYSIS_CACHE_DYNAMIC[-1]["router_scores"][layer_idx] = {
             "logits": gating_output.clone().cpu(),
-            "scores": torch.softmax(gating_output, dim=-1).clone().cpu(),
+            "scores": scores.clone().cpu(),
             "topk_scores": topk_weights.clone().cpu(),
             "topk_ids": topk_ids.clone().cpu(),
         }
@@ -1071,9 +1072,11 @@ def grouped_topk(hidden_states: torch.Tensor,
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
 
     if ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED and "balance_loss" in ANALYSIS_TYPE and ANALYSIS_CACHE_DYNAMIC[-1] is not None and layer_idx is not None:  # 🔍
+        if "original_scores" not in locals():
+            original_scores = scores
         balance_loss = switch_load_balancing_loss_func(
-            scores,
-            torch.zeros_like(scores).scatter(1, topk_ids, 1),
+            original_scores,
+            torch.zeros_like(original_scores).scatter(1, topk_ids, 1),
             topk,
             moe_aux_loss_coeff=1.0,
         )
@@ -1082,11 +1085,13 @@ def grouped_topk(hidden_states: torch.Tensor,
         ANALYSIS_CACHE_DYNAMIC[-1]["balance_loss"][layer_idx] = balance_loss.clone().cpu()
 
     if ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED and "router_scores" in ANALYSIS_TYPE and ANALYSIS_CACHE_DYNAMIC[-1] is not None and layer_idx is not None:  # 🔍
+        if "original_scores" not in locals():
+            original_scores = scores
         if "router_scores" not in ANALYSIS_CACHE_DYNAMIC[-1]:
             ANALYSIS_CACHE_DYNAMIC[-1]["router_scores"] = {}
         ANALYSIS_CACHE_DYNAMIC[-1]["router_scores"][layer_idx] = {
             "logits": gating_output.clone().cpu(),
-            "scores": scores.clone().cpu(),
+            "scores": original_scores.clone().cpu(),
             "topk_scores": topk_weights.clone().cpu(),
             "topk_ids": topk_ids.clone().cpu(),
         }
