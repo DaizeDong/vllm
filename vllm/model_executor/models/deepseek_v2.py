@@ -59,6 +59,7 @@ from .utils import (PPMissingLayer, is_pp_missing_parameter,
                     maybe_prefix)
 
 try:  # 🔍
+    import os
     import analysis_utils
     from analysis_utils import (
         PID,
@@ -71,10 +72,10 @@ try:  # 🔍
         MAX_TOKENS_FOR_ANALYSIS,
         save_analysis_cache_single_batch
     )
-
     ANALYSIS_MODULE_LOADED = True
 except Exception as e:
     ANALYSIS_MODULE_LOADED = False
+print(f"[{os.getpid()}] ANALYSIS_MODULE_LOADED: {ANALYSIS_MODULE_LOADED}")
 
 
 class DeepseekV2MLP(nn.Module):
@@ -751,7 +752,7 @@ class DeepseekV2Model(nn.Module):
         if ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED and "input_ids" in ANALYSIS_TYPE and ANALYSIS_CACHE_DYNAMIC[-1] is not None:  # 🔍
             ANALYSIS_CACHE_DYNAMIC[-1]["input_ids"] = input_ids.clone().cpu()
         # if ANALYSIS_MODULE_LOADED:
-        #     print("input_ids", input_ids.shape, "\n", input_ids)
+        #     print(f"[{PID}] input_ids ({input_ids.shape})\n{input_ids}")
 
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
@@ -809,6 +810,7 @@ class DeepseekV2ForCausalLM(nn.Module, SupportsPP):
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
         if ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED:  # 🔍
+            global ANALYSIS_TOKEN_NUM
             if not torch.any(input_ids):
                 ANALYSIS_CACHE_DYNAMIC.append(None)  # not analyse for the sanity checking step
             else:
@@ -816,9 +818,9 @@ class DeepseekV2ForCausalLM(nn.Module, SupportsPP):
                     ANALYSIS_CACHE_DYNAMIC.append({})
                 else:
                     ANALYSIS_CACHE_DYNAMIC.append(None)  # not analyse when the number of tokens exceeds the limit
-                global ANALYSIS_TOKEN_NUM
                 ANALYSIS_TOKEN_NUM += input_ids.numel()
-                print(f"[{PID}] ANALYSIS_TOKEN_NUM={ANALYSIS_TOKEN_NUM}")
+            # print(f"[{PID}] ANALYSIS_TOKEN_NUM={ANALYSIS_TOKEN_NUM}")
+
 
         hidden_states = self.model(input_ids, positions, intermediate_tensors,
                                    inputs_embeds)
