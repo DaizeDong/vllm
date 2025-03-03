@@ -61,13 +61,17 @@ from .utils import (PPMissingLayer, is_pp_missing_parameter,
 try:  # 🔍
     import analysis_utils
     from analysis_utils import (
+        PID,
         ANALYSIS_ENABLED,
         ANALYSIS_TYPE,
         ANALYSIS_CACHE_DYNAMIC,
         ANALYSIS_CACHE_STATIC,
         ANALYSIS_CACHE_BATCH_ID,
+        ANALYSIS_TOKEN_NUM,
+        MAX_TOKENS_FOR_ANALYSIS,
         save_analysis_cache_single_batch
     )
+
     ANALYSIS_MODULE_LOADED = True
 except Exception as e:
     ANALYSIS_MODULE_LOADED = False
@@ -746,8 +750,8 @@ class DeepseekV2Model(nn.Module):
     ) -> Union[torch.Tensor, IntermediateTensors]:
         if ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED and "input_ids" in ANALYSIS_TYPE and ANALYSIS_CACHE_DYNAMIC[-1] is not None:  # 🔍
             ANALYSIS_CACHE_DYNAMIC[-1]["input_ids"] = input_ids.clone().cpu()
-        if ANALYSIS_MODULE_LOADED:
-            print("input_ids", input_ids.shape, "\n", input_ids)
+        # if ANALYSIS_MODULE_LOADED:
+        #     print("input_ids", input_ids.shape, "\n", input_ids)
 
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
@@ -808,14 +812,21 @@ class DeepseekV2ForCausalLM(nn.Module, SupportsPP):
             if not torch.any(input_ids):
                 ANALYSIS_CACHE_DYNAMIC.append(None)  # not analyse for the sanity checking step
             else:
-                ANALYSIS_CACHE_DYNAMIC.append({})
+                if ANALYSIS_TOKEN_NUM <= MAX_TOKENS_FOR_ANALYSIS:
+                    ANALYSIS_CACHE_DYNAMIC.append({})
+                else:
+                    ANALYSIS_CACHE_DYNAMIC.append(None)  # not analyse when the number of tokens exceeds the limit
+                global ANALYSIS_TOKEN_NUM
+                ANALYSIS_TOKEN_NUM += input_ids.numel()
+                print(f"[{PID}] ANALYSIS_TOKEN_NUM={ANALYSIS_TOKEN_NUM}")
 
         hidden_states = self.model(input_ids, positions, intermediate_tensors,
                                    inputs_embeds)
 
         # if ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED:  # 🔍
-        #     save_analysis_cache_single_batch(save_static=ANALYSIS_CACHE_BATCH_ID[0] == 0 and ANALYSIS_CACHE_DYNAMIC[0] is not None)
-        #     ANALYSIS_CACHE_BATCH_ID[0] += 1
+        #     global ANALYSIS_CACHE_BATCH_ID
+        #     save_analysis_cache_single_batch(save_static=ANALYSIS_CACHE_BATCH_ID == 0 and ANALYSIS_CACHE_DYNAMIC[0] is not None)
+        #     ANALYSIS_CACHE_BATCH_ID += 1
         return hidden_states
 
     def compute_logits(
