@@ -555,8 +555,6 @@ class DeepseekV2DecoderLayer(nn.Module):
         rope_theta = getattr(config, "rope_theta", 10000)
         rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
-        # max_position_embeddings = 1024  # 🔍 for DeepSeek-240B
-        # rope_scaling["original_max_position_embeddings"] = 1024  # 🔍 for DeepSeek-240B
         # DecoderLayers are created with `make_layers` which passes the prefix
         # with the layer's index.
         layer_idx = int(prefix.split(sep='.')[-1])
@@ -759,7 +757,6 @@ class DeepseekV2Model(nn.Module):
     ) -> Union[torch.Tensor, IntermediateTensors]:
         if ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED and "input_ids" in ANALYSIS_TYPE and ANALYSIS_CACHE_DYNAMIC[-1] is not None:  # 🔍
             ANALYSIS_CACHE_DYNAMIC[-1]["input_ids"] = input_ids.clone().cpu()
-        # if ANALYSIS_MODULE_LOADED:
         #     print(f"[{PID}] input_ids ({input_ids.shape})\n{input_ids}")
 
         if get_pp_group().is_first_rank:
@@ -820,15 +817,13 @@ class DeepseekV2ForCausalLM(nn.Module, SupportsPP):
         if ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED:  # 🔍
             global ANALYSIS_TOKEN_NUM
             if not torch.any(input_ids):
-                ANALYSIS_CACHE_DYNAMIC.append(None)  # not analyse for the sanity checking step
+                ANALYSIS_CACHE_DYNAMIC.append(None)  # not analyze for the sanity checking step
             else:
                 if ANALYSIS_TOKEN_NUM <= MAX_TOKENS_FOR_ANALYSIS:
                     ANALYSIS_CACHE_DYNAMIC.append({})
                 else:
-                    ANALYSIS_CACHE_DYNAMIC.append(None)  # not analyse when the number of tokens exceeds the limit
+                    ANALYSIS_CACHE_DYNAMIC.append(None)  # not analyze when the number of tokens exceeds the limit
                 ANALYSIS_TOKEN_NUM += input_ids.numel()
-            # print(f"[{PID}] ANALYSIS_TOKEN_NUM={ANALYSIS_TOKEN_NUM}")
-
 
         hidden_states = self.model(input_ids, positions, intermediate_tensors,
                                    inputs_embeds)
