@@ -190,10 +190,32 @@ class DeepseekV2MoE(nn.Module):
         if self.n_shared_experts is not None:
             shared_output = self.shared_experts(hidden_states)
 
-            if self.tp_size > 1:
-                shared_output = tensor_model_parallel_all_reduce(shared_output)  # 🔍 reduce ahead for accurate recording
+            if ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED:
+                if self.tp_size > 1:  # 🔍 reduce ahead for accurate recording
+                    shared_output = tensor_model_parallel_all_reduce(shared_output)
+                if ANALYSIS_CACHE_DYNAMIC[-1] is not None:  # 🔍
+                    for name, p in [
+                        (string, int(re.search(r"magnitude_l(\d+)", string).group(1)))
+                        for string in ANALYSIS_TYPE
+                        if re.search(r"magnitude_l(\d+)", string)
+                    ]:
+                        if name not in ANALYSIS_CACHE_DYNAMIC[-1]:
+                            ANALYSIS_CACHE_DYNAMIC[-1][name] = {}
+                        if self.layer_idx not in ANALYSIS_CACHE_DYNAMIC[-1][name]:
+                            ANALYSIS_CACHE_DYNAMIC[-1][name][self.layer_idx] = {}
+                        ANALYSIS_CACHE_DYNAMIC[-1][name][self.layer_idx]["shared_experts_outputs"] = torch.norm(shared_output, p=p, dim=-1, dtype=torch.float32).cpu()
 
-            if ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED and ANALYSIS_CACHE_DYNAMIC[-1] is not None:  # 🔍
+        # router_logits: (num_tokens, n_experts)
+        router_logits, _ = self.gate(hidden_states.type(torch.float32))
+        final_hidden_states = self.experts(
+            hidden_states=hidden_states,
+            router_logits=router_logits
+        ) * self.routed_scaling_factor
+
+        if ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED:
+            if self.tp_size > 1:  # 🔍 reduce ahead for accurate recording
+                final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+            if ANALYSIS_CACHE_DYNAMIC[-1] is not None:  # 🔍
                 for name, p in [
                     (string, int(re.search(r"magnitude_l(\d+)", string).group(1)))
                     for string in ANALYSIS_TYPE
@@ -203,34 +225,14 @@ class DeepseekV2MoE(nn.Module):
                         ANALYSIS_CACHE_DYNAMIC[-1][name] = {}
                     if self.layer_idx not in ANALYSIS_CACHE_DYNAMIC[-1][name]:
                         ANALYSIS_CACHE_DYNAMIC[-1][name][self.layer_idx] = {}
-                    ANALYSIS_CACHE_DYNAMIC[-1][name][self.layer_idx]["shared_experts_outputs"] = torch.norm(shared_output, p=p, dim=-1, dtype=torch.float32).cpu()
-
-        # router_logits: (num_tokens, n_experts)
-        router_logits, _ = self.gate(hidden_states.type(torch.float32))
-        final_hidden_states = self.experts(
-            hidden_states=hidden_states,
-            router_logits=router_logits
-        ) * self.routed_scaling_factor
-
-        if self.tp_size > 1:
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)  # 🔍 reduce ahead for accurate recording
-
-        if ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED and ANALYSIS_CACHE_DYNAMIC[-1] is not None:  # 🔍
-            for name, p in [
-                (string, int(re.search(r"magnitude_l(\d+)", string).group(1)))
-                for string in ANALYSIS_TYPE
-                if re.search(r"magnitude_l(\d+)", string)
-            ]:
-                if name not in ANALYSIS_CACHE_DYNAMIC[-1]:
-                    ANALYSIS_CACHE_DYNAMIC[-1][name] = {}
-                if self.layer_idx not in ANALYSIS_CACHE_DYNAMIC[-1][name]:
-                    ANALYSIS_CACHE_DYNAMIC[-1][name][self.layer_idx] = {}
-                ANALYSIS_CACHE_DYNAMIC[-1][name][self.layer_idx]["routed_experts_outputs"] = torch.norm(final_hidden_states, p=p, dim=-1, dtype=torch.float32).cpu()
+                    ANALYSIS_CACHE_DYNAMIC[-1][name][self.layer_idx]["routed_experts_outputs"] = torch.norm(final_hidden_states, p=p, dim=-1, dtype=torch.float32).cpu()
 
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
-        # if self.tp_size > 1:
-        #     final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+
+        if not (ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED):
+            if self.tp_size > 1:
+                final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
