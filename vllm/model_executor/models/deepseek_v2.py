@@ -60,21 +60,71 @@ from .utils import (PPMissingLayer, is_pp_missing_parameter,
                     maybe_prefix)
 
 try:  # 🔍
-    import os
     import analysis_utils
     from analysis_utils import (
         PID,
-        ANALYSIS_ENABLED,
         ANALYSIS_TYPE,
+        ANALYSIS_ARGS,
         ANALYSIS_CACHE_DYNAMIC,
         ANALYSIS_CACHE_STATIC,
-        ANALYSIS_ARGS,
-        save_analysis_cache_single_batch
+        save_analysis_cache_single_batch,
     )
     ANALYSIS_MODULE_LOADED = True
 except Exception as e:
+    import os
+    PID = os.getpid()
     ANALYSIS_MODULE_LOADED = False
-print(f"[{os.getpid()}] ANALYSIS_MODULE_LOADED: {ANALYSIS_MODULE_LOADED}")
+print(f"[{PID}] ANALYSIS_MODULE_LOADED: {ANALYSIS_MODULE_LOADED}")
+
+
+@torch._dynamo.disable
+def record_value(value_name, value):  # 🔍
+    if not analysis_utils.ANALYSIS_ENABLED:
+        return
+    if not ANALYSIS_CACHE_DYNAMIC or ANALYSIS_CACHE_DYNAMIC[-1] is None:
+        return
+    if value_name not in ANALYSIS_TYPE:
+        return
+    ANALYSIS_CACHE_DYNAMIC[-1][value_name] = value.clone().cpu()
+    # print(f"[{PID}] {value_name} ({value.shape})\n{value}")
+
+
+@torch._dynamo.disable
+def record_layer_value(value_name, value, layer_idx):  # 🔍
+    if not analysis_utils.ANALYSIS_ENABLED:
+        return
+    if not ANALYSIS_CACHE_DYNAMIC or ANALYSIS_CACHE_DYNAMIC[-1] is None:
+        return
+    if value_name not in ANALYSIS_TYPE:
+        return
+    if value_name not in ANALYSIS_CACHE_DYNAMIC[-1]:
+        ANALYSIS_CACHE_DYNAMIC[-1][value_name] = {}
+    ANALYSIS_CACHE_DYNAMIC[-1][value_name][layer_idx] = value.clone().cpu()
+
+
+@torch._dynamo.disable
+def record_layer_magnitude(value_name, value, layer_idx):  # 🔍
+    if not analysis_utils.ANALYSIS_ENABLED:
+        return
+    if not ANALYSIS_CACHE_DYNAMIC or ANALYSIS_CACHE_DYNAMIC[-1] is None:
+        return
+    for name, p in [
+        (string, int(re.search(r"magnitude_l(\d+)", string).group(1)))
+        for string in ANALYSIS_TYPE
+        if re.search(r"magnitude_l(\d+)", string)
+    ]:
+        if name not in ANALYSIS_CACHE_DYNAMIC[-1]:
+            ANALYSIS_CACHE_DYNAMIC[-1][name] = {}
+        if layer_idx not in ANALYSIS_CACHE_DYNAMIC[-1][name]:
+            ANALYSIS_CACHE_DYNAMIC[-1][name][layer_idx] = {}
+        ANALYSIS_CACHE_DYNAMIC[-1][name][layer_idx][value_name] = torch.norm(value, p=p, dim=-1, dtype=torch.float32).cpu()
+
+
+@torch._dynamo.disable
+def record_layer_weights(value_name, value, layer_idx):  # 🔍
+    if value_name not in ANALYSIS_CACHE_STATIC:
+        ANALYSIS_CACHE_STATIC[value_name] = {}
+    ANALYSIS_CACHE_STATIC[value_name][layer_idx] = value.clone().cpu()
 
 
 class DeepseekV2MLP(nn.Module):
@@ -179,30 +229,18 @@ class DeepseekV2MoE(nn.Module):
             )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED and "router_inputs" in ANALYSIS_TYPE and ANALYSIS_CACHE_DYNAMIC[-1] is not None:  # 🔍
-            if "router_inputs" not in ANALYSIS_CACHE_DYNAMIC[-1]:
-                ANALYSIS_CACHE_DYNAMIC[-1]["router_inputs"] = {}
-            ANALYSIS_CACHE_DYNAMIC[-1]["router_inputs"][self.layer_idx] = hidden_states.clone().cpu()
+        if ANALYSIS_MODULE_LOADED:  # 🔍
+            record_layer_value("router_inputs", hidden_states, self.layer_idx)
 
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
         if self.n_shared_experts is not None:
             shared_output = self.shared_experts(hidden_states)
 
-            if ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED:
-                if self.tp_size > 1:  # 🔍 reduce ahead for accurate recording
+            if ANALYSIS_MODULE_LOADED:  # 🔍
+                if self.tp_size > 1:  # reduce ahead for accurate recording
                     shared_output = tensor_model_parallel_all_reduce(shared_output)
-                if ANALYSIS_CACHE_DYNAMIC[-1] is not None:  # 🔍
-                    for name, p in [
-                        (string, int(re.search(r"magnitude_l(\d+)", string).group(1)))
-                        for string in ANALYSIS_TYPE
-                        if re.search(r"magnitude_l(\d+)", string)
-                    ]:
-                        if name not in ANALYSIS_CACHE_DYNAMIC[-1]:
-                            ANALYSIS_CACHE_DYNAMIC[-1][name] = {}
-                        if self.layer_idx not in ANALYSIS_CACHE_DYNAMIC[-1][name]:
-                            ANALYSIS_CACHE_DYNAMIC[-1][name][self.layer_idx] = {}
-                        ANALYSIS_CACHE_DYNAMIC[-1][name][self.layer_idx]["shared_experts_outputs"] = torch.norm(shared_output, p=p, dim=-1, dtype=torch.float32).cpu()
+                record_layer_magnitude("shared_experts_outputs", shared_output, self.layer_idx)
 
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states.type(torch.float32))
@@ -211,25 +249,15 @@ class DeepseekV2MoE(nn.Module):
             router_logits=router_logits
         ) * self.routed_scaling_factor
 
-        if ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED:
-            if self.tp_size > 1:  # 🔍 reduce ahead for accurate recording
+        if ANALYSIS_MODULE_LOADED:  # 🔍
+            if self.tp_size > 1:  # reduce ahead for accurate recording
                 final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
-            if ANALYSIS_CACHE_DYNAMIC[-1] is not None:  # 🔍
-                for name, p in [
-                    (string, int(re.search(r"magnitude_l(\d+)", string).group(1)))
-                    for string in ANALYSIS_TYPE
-                    if re.search(r"magnitude_l(\d+)", string)
-                ]:
-                    if name not in ANALYSIS_CACHE_DYNAMIC[-1]:
-                        ANALYSIS_CACHE_DYNAMIC[-1][name] = {}
-                    if self.layer_idx not in ANALYSIS_CACHE_DYNAMIC[-1][name]:
-                        ANALYSIS_CACHE_DYNAMIC[-1][name][self.layer_idx] = {}
-                    ANALYSIS_CACHE_DYNAMIC[-1][name][self.layer_idx]["routed_experts_outputs"] = torch.norm(final_hidden_states, p=p, dim=-1, dtype=torch.float32).cpu()
+            record_layer_magnitude("routed_experts_outputs", final_hidden_states, self.layer_idx)
 
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
 
-        if not (ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED):
+        if not ANALYSIS_MODULE_LOADED:  # 🔍
             if self.tp_size > 1:
                 final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
@@ -618,87 +646,29 @@ class DeepseekV2DecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
-        if ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED and ANALYSIS_CACHE_DYNAMIC[-1] is not None:  # 🔍
-            for name, p in [
-                (string, int(re.search(r"magnitude_l(\d+)", string).group(1)))
-                for string in ANALYSIS_TYPE
-                if re.search(r"magnitude_l(\d+)", string)
-            ]:
-                if name not in ANALYSIS_CACHE_DYNAMIC[-1]:
-                    ANALYSIS_CACHE_DYNAMIC[-1][name] = {}
-                if self.layer_idx not in ANALYSIS_CACHE_DYNAMIC[-1][name]:
-                    ANALYSIS_CACHE_DYNAMIC[-1][name][self.layer_idx] = {}
-                ANALYSIS_CACHE_DYNAMIC[-1][name][self.layer_idx]["attn_residual"] = torch.norm(residual, p=p, dim=-1, dtype=torch.float32).cpu()
+        if ANALYSIS_MODULE_LOADED:  # 🔍
+            record_layer_magnitude("attn_residual", residual, self.layer_idx)
 
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
         )
 
-        if ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED and ANALYSIS_CACHE_DYNAMIC[-1] is not None:  # 🔍
-            for name, p in [
-                (string, int(re.search(r"magnitude_l(\d+)", string).group(1)))
-                for string in ANALYSIS_TYPE
-                if re.search(r"magnitude_l(\d+)", string)
-            ]:
-                if name not in ANALYSIS_CACHE_DYNAMIC[-1]:
-                    ANALYSIS_CACHE_DYNAMIC[-1][name] = {}
-                if self.layer_idx not in ANALYSIS_CACHE_DYNAMIC[-1][name]:
-                    ANALYSIS_CACHE_DYNAMIC[-1][name][self.layer_idx] = {}
-                ANALYSIS_CACHE_DYNAMIC[-1][name][self.layer_idx]["attn_outputs"] = torch.norm(hidden_states, p=p, dim=-1, dtype=torch.float32).cpu()
-
-        if ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED and ANALYSIS_CACHE_DYNAMIC[-1] is not None:  # 🔍
-            for name, p in [
-                (string, int(re.search(r"magnitude_l(\d+)", string).group(1)))
-                for string in ANALYSIS_TYPE
-                if re.search(r"magnitude_l(\d+)", string)
-            ]:
-                if name not in ANALYSIS_CACHE_DYNAMIC[-1]:
-                    ANALYSIS_CACHE_DYNAMIC[-1][name] = {}
-                if self.layer_idx not in ANALYSIS_CACHE_DYNAMIC[-1][name]:
-                    ANALYSIS_CACHE_DYNAMIC[-1][name][self.layer_idx] = {}
-                ANALYSIS_CACHE_DYNAMIC[-1][name][self.layer_idx]["attn_residual_outputs"] = torch.norm(hidden_states + residual.to(torch.float32), p=p, dim=-1, dtype=torch.float32).cpu()
+        if ANALYSIS_MODULE_LOADED:  # 🔍
+            record_layer_magnitude("attn_outputs", hidden_states, self.layer_idx)
+            record_layer_magnitude("attn_residual_outputs", hidden_states + residual.to(torch.float32), self.layer_idx)
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
 
-        if ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED and ANALYSIS_CACHE_DYNAMIC[-1] is not None:  # 🔍
-            for name, p in [
-                (string, int(re.search(r"magnitude_l(\d+)", string).group(1)))
-                for string in ANALYSIS_TYPE
-                if re.search(r"magnitude_l(\d+)", string)
-            ]:
-                if name not in ANALYSIS_CACHE_DYNAMIC[-1]:
-                    ANALYSIS_CACHE_DYNAMIC[-1][name] = {}
-                if self.layer_idx not in ANALYSIS_CACHE_DYNAMIC[-1][name]:
-                    ANALYSIS_CACHE_DYNAMIC[-1][name][self.layer_idx] = {}
-                ANALYSIS_CACHE_DYNAMIC[-1][name][self.layer_idx]["mlp_residual"] = torch.norm(residual, p=p, dim=-1, dtype=torch.float32).cpu()
+        if ANALYSIS_MODULE_LOADED:  # 🔍
+            record_layer_magnitude("mlp_residual", residual, self.layer_idx)
 
         hidden_states = self.mlp(hidden_states)
 
-        if ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED and ANALYSIS_CACHE_DYNAMIC[-1] is not None:  # 🔍
-            for name, p in [
-                (string, int(re.search(r"magnitude_l(\d+)", string).group(1)))
-                for string in ANALYSIS_TYPE
-                if re.search(r"magnitude_l(\d+)", string)
-            ]:
-                if name not in ANALYSIS_CACHE_DYNAMIC[-1]:
-                    ANALYSIS_CACHE_DYNAMIC[-1][name] = {}
-                if self.layer_idx not in ANALYSIS_CACHE_DYNAMIC[-1][name]:
-                    ANALYSIS_CACHE_DYNAMIC[-1][name][self.layer_idx] = {}
-                ANALYSIS_CACHE_DYNAMIC[-1][name][self.layer_idx]["mlp_outputs"] = torch.norm(hidden_states, p=p, dim=-1, dtype=torch.float32).cpu()
-
-        if ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED and ANALYSIS_CACHE_DYNAMIC[-1] is not None:  # 🔍
-            for name, p in [
-                (string, int(re.search(r"magnitude_l(\d+)", string).group(1)))
-                for string in ANALYSIS_TYPE
-                if re.search(r"magnitude_l(\d+)", string)
-            ]:
-                if name not in ANALYSIS_CACHE_DYNAMIC[-1]:
-                    ANALYSIS_CACHE_DYNAMIC[-1][name] = {}
-                if self.layer_idx not in ANALYSIS_CACHE_DYNAMIC[-1][name]:
-                    ANALYSIS_CACHE_DYNAMIC[-1][name][self.layer_idx] = {}
-                ANALYSIS_CACHE_DYNAMIC[-1][name][self.layer_idx]["mlp_residual_outputs"] = torch.norm(hidden_states + residual.to(torch.float32), p=p, dim=-1, dtype=torch.float32).cpu()
+        if ANALYSIS_MODULE_LOADED:  # 🔍
+            record_layer_magnitude("mlp_outputs", hidden_states, self.layer_idx)
+            record_layer_magnitude("mlp_residual", hidden_states + residual.to(torch.float32), self.layer_idx)
 
         return hidden_states, residual
 
@@ -756,9 +726,8 @@ class DeepseekV2Model(nn.Module):
         intermediate_tensors: Optional[IntermediateTensors],
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
-        if ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED and "input_ids" in ANALYSIS_TYPE and ANALYSIS_CACHE_DYNAMIC[-1] is not None:  # 🔍
-            ANALYSIS_CACHE_DYNAMIC[-1]["input_ids"] = input_ids.clone().cpu()
-        #     print(f"[{PID}] input_ids ({input_ids.shape})\n{input_ids}")
+        if ANALYSIS_MODULE_LOADED:  # 🔍
+            record_value("input_ids", input_ids)
 
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
@@ -815,7 +784,7 @@ class DeepseekV2ForCausalLM(nn.Module, SupportsPP):
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
-        if ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED:  # 🔍
+        if ANALYSIS_MODULE_LOADED and analysis_utils.ANALYSIS_ENABLED:  # 🔍
             if not torch.any(input_ids):
                 ANALYSIS_CACHE_DYNAMIC.append(None)  # not analyze for the sanity checking step
             else:
@@ -829,13 +798,6 @@ class DeepseekV2ForCausalLM(nn.Module, SupportsPP):
 
         hidden_states = self.model(input_ids, positions, intermediate_tensors,
                                    inputs_embeds)
-
-        # # batch-wise saving
-        # if ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED:  # 🔍
-        #     if "batch_id" not in ANALYSIS_ARGS:
-        #         ANALYSIS_ARGS["batch_id"] = -1
-        #     ANALYSIS_ARGS["batch_id"] += 1
-        #     save_analysis_cache_single_batch(ANALYSIS_ARGS["batch_id"], save_static=ANALYSIS_ARGS["batch_id"] == 0 and ANALYSIS_CACHE_DYNAMIC[0] is not None)
         return hidden_states
 
     def compute_logits(
@@ -956,19 +918,15 @@ class DeepseekV2ForCausalLM(nn.Module, SupportsPP):
                     weight_loader(param, loaded_weight)
             loaded_params.add(name)
 
-        if ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED and "router_weights" in ANALYSIS_TYPE:  # 🔍
-            if "router_weights" not in ANALYSIS_CACHE_STATIC:
-                ANALYSIS_CACHE_STATIC["router_weights"] = {}
+        if ANALYSIS_MODULE_LOADED:  # 🔍
             for layer_idx, decoder in enumerate(self.model.layers):
                 if isinstance(decoder.mlp, DeepseekV2MoE):
-                    ANALYSIS_CACHE_STATIC["router_weights"][layer_idx] = decoder.mlp.gate.__dict__["_parameters"]["weight"].data.clone().cpu()
+                    record_layer_weights("router_weights", decoder.mlp.gate.__dict__["_parameters"]["weight"].data, layer_idx)
 
-        if ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED and "router_bias" in ANALYSIS_TYPE:  # 🔍
-            if "router_bias" not in ANALYSIS_CACHE_STATIC:
-                ANALYSIS_CACHE_STATIC["router_bias"] = {}
+        if ANALYSIS_MODULE_LOADED:  # 🔍
             for layer_idx, decoder in enumerate(self.model.layers):
                 if isinstance(decoder.mlp, DeepseekV2MoE) and isinstance(decoder.mlp.gate.e_score_correction_bias, nn.Parameter):
-                    ANALYSIS_CACHE_STATIC["router_bias"][layer_idx] = decoder.mlp.gate.e_score_correction_bias.data.clone().cpu()
+                    record_layer_weights("router_bias", decoder.mlp.gate.e_score_correction_bias.data, layer_idx)
 
         return loaded_params
 

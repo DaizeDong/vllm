@@ -48,9 +48,13 @@ from vllm.utils import Counter, deprecate_args, deprecate_kwargs, is_list_of
 
 try:  # 🔍
     import analysis_utils
-    from analysis_utils import save_analysis_cache, PID
+    from analysis_utils import (
+        PID,
+        save_analysis_cache,
+    )
     ANALYSIS_MODULE_LOADED = True
 except Exception as e:
+    PID = os.getpid()
     ANALYSIS_MODULE_LOADED = False
 
 logger = init_logger(__name__)

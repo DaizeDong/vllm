@@ -19,12 +19,80 @@ from vllm.utils import direct_register_custom_op
 
 try:  # 🔍
     import analysis_utils
-    from analysis_utils import ANALYSIS_ENABLED, ANALYSIS_TYPE, ANALYSIS_CACHE_DYNAMIC
+    from analysis_utils import (
+        PID,
+        ANALYSIS_TYPE,
+        ANALYSIS_CACHE_DYNAMIC,
+    )
     ANALYSIS_MODULE_LOADED = True
 except Exception as e:
+    import os
+    PID = os.getpid()
     ANALYSIS_MODULE_LOADED = False
 
 logger = init_logger(__name__)
+
+
+@torch._dynamo.disable
+def record_layer_balance_loss(value_name, scores, topk_ids, topk, layer_idx):  # 🔍
+
+    def switch_load_balancing_loss_func(probs: torch.Tensor, tokens_per_expert: torch.Tensor, topk: int, moe_aux_loss_coeff: float):
+        """Calculate the auxiliary loss for better load balacing.
+        Please refer to the Switch Transformer paper (https://arxiv.org/abs/2101.03961) for details.
+
+        Args:
+            probs (torch.Tensor): The softmax probs output by the router for each token. [num_tokens, num_experts]
+            tokens_per_expert (torch.Tensor): The number of assigned tokens for each expert. [num_experts]
+
+        Returns:
+            torch.Tensor: The auxiliary loss for load balancing.
+        """
+        num_sub_seq = 1
+        num_tokens = probs.shape[0] * topk * num_sub_seq
+        num_experts = probs.shape[1]
+
+        probs = torch.nn.functional.normalize(probs, p=1, dim=-1)
+        probs_mean_per_expert = probs.clone().float().mean(dim=0)
+        aux_loss = torch.sum(probs_mean_per_expert * tokens_per_expert.clone().float()) * (num_experts / num_tokens * moe_aux_loss_coeff)
+        return aux_loss
+
+    if not analysis_utils.ANALYSIS_ENABLED:
+        return
+    if not ANALYSIS_CACHE_DYNAMIC or ANALYSIS_CACHE_DYNAMIC[-1] is None:
+        return
+    if value_name not in ANALYSIS_TYPE:
+        return
+    if layer_idx is None:
+        return
+    if value_name not in ANALYSIS_CACHE_DYNAMIC[-1]:
+        ANALYSIS_CACHE_DYNAMIC[-1][value_name] = {}
+    balance_loss = switch_load_balancing_loss_func(
+        scores,
+        torch.zeros_like(scores).scatter(1, topk_ids, 1),
+        topk,
+        moe_aux_loss_coeff=1.0,
+    )
+    ANALYSIS_CACHE_DYNAMIC[-1][value_name][layer_idx] = balance_loss.clone().cpu()
+
+
+@torch._dynamo.disable
+def record_layer_router_scores(value_name, logits, scores, topk_scores, topk_ids, layer_idx):  # 🔍
+    if not analysis_utils.ANALYSIS_ENABLED:
+        return
+    if not ANALYSIS_CACHE_DYNAMIC or ANALYSIS_CACHE_DYNAMIC[-1] is None:
+        return
+    if value_name not in ANALYSIS_TYPE:
+        return
+    if layer_idx is None:
+        return
+    if value_name not in ANALYSIS_CACHE_DYNAMIC[-1]:
+        ANALYSIS_CACHE_DYNAMIC[-1][value_name] = {}
+    ANALYSIS_CACHE_DYNAMIC[-1][value_name][layer_idx] = {
+        "logits": logits.clone().cpu(),
+        "scores": scores.clone().cpu(),
+        "topk_scores": topk_scores.clone().cpu(),
+        "topk_ids": topk_ids.clone().cpu(),
+    }
 
 
 @triton.jit
@@ -929,30 +997,6 @@ def try_get_optimal_moe_config(
     return config
 
 
-def switch_load_balancing_loss_func(
-    probs: torch.Tensor, tokens_per_expert: torch.Tensor, topk: int, moe_aux_loss_coeff: float
-):
-    """Calculate the auxiliary loss for better load balacing.
-    Please refer to the Switch Transformer paper (https://arxiv.org/abs/2101.03961) for details.
-
-    Args:
-        probs (torch.Tensor): The softmax probs output by the router for each token. [num_tokens, num_experts]
-        tokens_per_expert (torch.Tensor): The number of assigned tokens for each expert. [num_experts]
-
-    Returns:
-        torch.Tensor: The auxiliary loss for load balancing.
-    """
-    num_sub_seq = 1
-
-    num_tokens = probs.shape[0] * topk * num_sub_seq
-    num_experts = probs.shape[1]
-
-    probs = torch.nn.functional.normalize(probs, p=1, dim=-1)
-    probs_mean_per_expert = probs.clone().float().mean(dim=0)
-    aux_loss = torch.sum(probs_mean_per_expert * tokens_per_expert.clone().float()) * (num_experts / num_tokens * moe_aux_loss_coeff)
-    return aux_loss
-
-
 def fused_topk(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -989,28 +1033,10 @@ def fused_topk(
     if renormalize:
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
 
-    if ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED and "balance_loss" in ANALYSIS_TYPE and ANALYSIS_CACHE_DYNAMIC[-1] is not None and layer_idx is not None:  # 🔍
+    if ANALYSIS_MODULE_LOADED:  # 🔍
         scores = torch.softmax(gating_output, dim=-1, dtype=torch.float32)
-        balance_loss = switch_load_balancing_loss_func(
-            scores,
-            torch.zeros_like(scores).scatter(1, topk_ids, 1),
-            topk,
-            moe_aux_loss_coeff=1.0,
-        )
-        if "balance_loss" not in ANALYSIS_CACHE_DYNAMIC[-1]:
-            ANALYSIS_CACHE_DYNAMIC[-1]["balance_loss"] = {}
-        ANALYSIS_CACHE_DYNAMIC[-1]["balance_loss"][layer_idx] = balance_loss.clone().cpu()
-
-    if ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED and "router_scores" in ANALYSIS_TYPE and ANALYSIS_CACHE_DYNAMIC[-1] is not None and layer_idx is not None:  # 🔍
-        scores = torch.softmax(gating_output, dim=-1, dtype=torch.float32)
-        if "router_scores" not in ANALYSIS_CACHE_DYNAMIC[-1]:
-            ANALYSIS_CACHE_DYNAMIC[-1]["router_scores"] = {}
-        ANALYSIS_CACHE_DYNAMIC[-1]["router_scores"][layer_idx] = {
-            "logits": gating_output.clone().cpu(),
-            "scores": scores.clone().cpu(),
-            "topk_scores": topk_weights.clone().cpu(),
-            "topk_ids": topk_ids.clone().cpu(),
-        }
+        record_layer_balance_loss("balance_loss", scores, topk_ids, topk, layer_idx)
+        record_layer_router_scores("router_scores", gating_output, scores, topk_weights, topk_ids, layer_idx)
 
     return topk_weights, topk_ids
 
@@ -1071,30 +1097,11 @@ def grouped_topk(hidden_states: torch.Tensor,
     if renormalize:
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
 
-    if ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED and "balance_loss" in ANALYSIS_TYPE and ANALYSIS_CACHE_DYNAMIC[-1] is not None and layer_idx is not None:  # 🔍
+    if ANALYSIS_MODULE_LOADED:  # 🔍
         if "original_scores" not in locals():
             original_scores = scores
-        balance_loss = switch_load_balancing_loss_func(
-            original_scores,
-            torch.zeros_like(original_scores).scatter(1, topk_ids, 1),
-            topk,
-            moe_aux_loss_coeff=1.0,
-        )
-        if "balance_loss" not in ANALYSIS_CACHE_DYNAMIC[-1]:
-            ANALYSIS_CACHE_DYNAMIC[-1]["balance_loss"] = {}
-        ANALYSIS_CACHE_DYNAMIC[-1]["balance_loss"][layer_idx] = balance_loss.clone().cpu()
-
-    if ANALYSIS_MODULE_LOADED and ANALYSIS_ENABLED and "router_scores" in ANALYSIS_TYPE and ANALYSIS_CACHE_DYNAMIC[-1] is not None and layer_idx is not None:  # 🔍
-        if "original_scores" not in locals():
-            original_scores = scores
-        if "router_scores" not in ANALYSIS_CACHE_DYNAMIC[-1]:
-            ANALYSIS_CACHE_DYNAMIC[-1]["router_scores"] = {}
-        ANALYSIS_CACHE_DYNAMIC[-1]["router_scores"][layer_idx] = {
-            "logits": gating_output.clone().cpu(),
-            "scores": original_scores.clone().cpu(),
-            "topk_scores": topk_weights.clone().cpu(),
-            "topk_ids": topk_ids.clone().cpu(),
-        }
+        record_layer_balance_loss("balance_loss", original_scores, topk_ids, topk, layer_idx)
+        record_layer_router_scores("router_scores", gating_output, original_scores, topk_weights, topk_ids, layer_idx)
 
     return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
 
