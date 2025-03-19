@@ -243,11 +243,15 @@ class DeepseekV2MoE(nn.Module):
                 record_layer_magnitude("shared_experts_outputs", shared_output, self.layer_idx)
 
         # router_logits: (num_tokens, n_experts)
-        router_logits, _ = self.gate(hidden_states.type(torch.float32))
-        final_hidden_states = self.experts(
-            hidden_states=hidden_states,
-            router_logits=router_logits
-        ) * self.routed_scaling_factor
+        router_logits, _ = self.gate(hidden_states)
+        if hidden_states.dtype != torch.float16:
+            final_hidden_states = self.experts(
+                hidden_states=hidden_states,
+                router_logits=router_logits) * self.routed_scaling_factor
+        else:
+            # This is a special case to avoid FP16 overflow
+            final_hidden_states = self.experts(hidden_states=hidden_states,
+                                               router_logits=router_logits)
 
         if ANALYSIS_MODULE_LOADED:  # 🔍
             if self.tp_size > 1:  # reduce ahead for accurate recording
@@ -255,7 +259,12 @@ class DeepseekV2MoE(nn.Module):
             record_layer_magnitude("routed_experts_outputs", final_hidden_states, self.layer_idx)
 
         if shared_output is not None:
-            final_hidden_states = final_hidden_states + shared_output
+            if hidden_states.dtype != torch.float16:
+                final_hidden_states = final_hidden_states + shared_output
+            else:
+                # This is a special case to avoid FP16 overflow
+                final_hidden_states = final_hidden_states + shared_output \
+                    * (1. / self.routed_scaling_factor)
 
         if not ANALYSIS_MODULE_LOADED:  # 🔍
             if self.tp_size > 1:
@@ -423,7 +432,7 @@ class DeepseekV2MLAAttention(nn.Module):
     """
     Main reference: DeepseekV2 paper, and FlashInfer Implementation
     (https://arxiv.org/abs/2405.04434 and https://github.com/flashinfer-ai/flashinfer/pull/551).
-
+    
     For more info see MLACommonImpl in: vllm/attention/backends/mla/utils.py
     """
 
@@ -583,7 +592,8 @@ class DeepseekV2DecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         rope_theta = getattr(config, "rope_theta", 10000)
         rope_scaling = getattr(config, "rope_scaling", None)
-        max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
+        max_position_embeddings = getattr(config, "max_position_embeddings",
+                                          8192)
         # DecoderLayers are created with `make_layers` which passes the prefix
         # with the layer's index.
         layer_idx = int(prefix.split(sep='.')[-1])
@@ -632,6 +642,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                                        eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size,
                                                 eps=config.rms_norm_eps)
+        self.routed_scaling_factor = config.routed_scaling_factor
 
     def forward(
         self,
@@ -644,7 +655,8 @@ class DeepseekV2DecoderLayer(nn.Module):
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+            hidden_states, residual = self.input_layernorm(
+                hidden_states, residual)
 
         if ANALYSIS_MODULE_LOADED:  # 🔍
             record_layer_magnitude("attn_residual", residual, self.layer_idx)
@@ -659,12 +671,22 @@ class DeepseekV2DecoderLayer(nn.Module):
             record_layer_magnitude("attn_residual_outputs", hidden_states + residual.to(torch.float32), self.layer_idx)
 
         # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        if isinstance(self.mlp, DeepseekV2MoE) and \
+            hidden_states.dtype == torch.float16:
+            # This is a special case to avoid FP16 overflow
+            hidden_states *= 1. / self.routed_scaling_factor
+        hidden_states, residual = self.post_attention_layernorm(
+            hidden_states, residual)
 
         if ANALYSIS_MODULE_LOADED:  # 🔍
             record_layer_magnitude("mlp_residual", residual, self.layer_idx)
 
         hidden_states = self.mlp(hidden_states)
+        if isinstance(self.mlp, DeepseekV2MLP) and \
+            hidden_states.dtype == torch.float16:
+            # This is a special case to avoid FP16 overflow
+            hidden_states *= 1. / self.routed_scaling_factor
+            residual *= 1. / self.routed_scaling_factor
 
         if ANALYSIS_MODULE_LOADED:  # 🔍
             record_layer_magnitude("mlp_outputs", hidden_states, self.layer_idx)
