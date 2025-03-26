@@ -79,6 +79,7 @@ print(f"[{PID}] ANALYSIS_MODULE_LOADED: {ANALYSIS_MODULE_LOADED}")
 
 @torch._dynamo.disable
 def record_value(value_name, value):  # 🔍
+    # print(f"[{PID}] {value_name} ({value.shape})\n{value}")
     if not analysis_utils.ANALYSIS_ENABLED:
         return
     if not ANALYSIS_CACHE_DYNAMIC or ANALYSIS_CACHE_DYNAMIC[-1] is None:
@@ -86,7 +87,6 @@ def record_value(value_name, value):  # 🔍
     if value_name not in ANALYSIS_TYPE:
         return
     ANALYSIS_CACHE_DYNAMIC[-1][value_name] = value.clone().cpu()
-    # print(f"[{PID}] {value_name} ({value.shape})\n{value}")
 
 
 @torch._dynamo.disable
@@ -942,14 +942,20 @@ class DeepseekV2ForCausalLM(nn.Module, SupportsPP):
             loaded_params.add(name)
 
         if ANALYSIS_MODULE_LOADED:  # 🔍
-            for layer_idx, decoder in enumerate(self.model.layers):
-                if isinstance(decoder.mlp, DeepseekV2MoE):
-                    record_layer_weights("router_weights", decoder.mlp.gate.__dict__["_parameters"]["weight"].data, layer_idx)
+            if analysis_utils.ANALYSIS_ENABLED and "router_weights" in ANALYSIS_TYPE:
+                for layer_idx, decoder in enumerate(self.model.layers):
+                    if isinstance(decoder.mlp, DeepseekV2MoE):
+                        record_layer_weights("router_weights", decoder.mlp.gate.__dict__["_parameters"]["weight"].data, layer_idx)
 
-        if ANALYSIS_MODULE_LOADED:  # 🔍
-            for layer_idx, decoder in enumerate(self.model.layers):
-                if isinstance(decoder.mlp, DeepseekV2MoE) and isinstance(decoder.mlp.gate.e_score_correction_bias, nn.Parameter):
-                    record_layer_weights("router_bias", decoder.mlp.gate.e_score_correction_bias.data, layer_idx)
+            if analysis_utils.ANALYSIS_ENABLED and "router_bias" in ANALYSIS_TYPE:
+                for layer_idx, decoder in enumerate(self.model.layers):
+                    if isinstance(decoder.mlp, DeepseekV2MoE) and isinstance(decoder.mlp.gate.e_score_correction_bias, nn.Parameter):
+                        record_layer_weights("router_bias", decoder.mlp.gate.e_score_correction_bias.data, layer_idx)
+
+            if analysis_utils.ANALYSIS_ENABLED and "norm_weights" in ANALYSIS_TYPE:
+                for layer_idx, decoder in enumerate(self.transformer.encoder.layers):
+                    record_layer_weights("pre_attn_norm_weight", decoder.input_layernorm.weight.data, layer_idx)
+                    record_layer_weights("pre_mlp_norm_weight", decoder.post_attention_layernorm.weight.data, layer_idx)
 
         return loaded_params
 
