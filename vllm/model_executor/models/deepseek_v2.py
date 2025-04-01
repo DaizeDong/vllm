@@ -84,7 +84,7 @@ def record_value(value_name, value):  # 🔍
         return
     if not ANALYSIS_CACHE_DYNAMIC or ANALYSIS_CACHE_DYNAMIC[-1] is None:
         return
-    if value_name not in ANALYSIS_TYPE:
+    if ANALYSIS_TYPE is None or value_name not in ANALYSIS_TYPE:
         return
     ANALYSIS_CACHE_DYNAMIC[-1][value_name] = value.clone().cpu()
 
@@ -95,7 +95,7 @@ def record_layer_value(value_name, value, layer_idx):  # 🔍
         return
     if not ANALYSIS_CACHE_DYNAMIC or ANALYSIS_CACHE_DYNAMIC[-1] is None:
         return
-    if value_name not in ANALYSIS_TYPE:
+    if ANALYSIS_TYPE is None or value_name not in ANALYSIS_TYPE:
         return
     if value_name not in ANALYSIS_CACHE_DYNAMIC[-1]:
         ANALYSIS_CACHE_DYNAMIC[-1][value_name] = {}
@@ -103,15 +103,15 @@ def record_layer_value(value_name, value, layer_idx):  # 🔍
 
 
 @torch._dynamo.disable
-def record_layer_magnitude(value_name, value, layer_idx):  # 🔍
+def record_layer_activation_magnitude(value_name, value, layer_idx):  # 🔍
     if not analysis_utils.ANALYSIS_ENABLED:
         return
     if not ANALYSIS_CACHE_DYNAMIC or ANALYSIS_CACHE_DYNAMIC[-1] is None:
         return
     for name, p in [
-        (string, int(re.search(r"magnitude_l(\d+)", string).group(1)))
+        (string, int(re.search(r"activation_magnitude_l(\d+)", string).group(1)))
         for string in ANALYSIS_TYPE
-        if re.search(r"magnitude_l(\d+)", string)
+        if re.search(r"activation_magnitude_l(\d+)", string)
     ]:
         if name not in ANALYSIS_CACHE_DYNAMIC[-1]:
             ANALYSIS_CACHE_DYNAMIC[-1][name] = {}
@@ -125,6 +125,21 @@ def record_layer_weights(value_name, value, layer_idx):  # 🔍
     if value_name not in ANALYSIS_CACHE_STATIC:
         ANALYSIS_CACHE_STATIC[value_name] = {}
     ANALYSIS_CACHE_STATIC[value_name][layer_idx] = value.clone().cpu()
+
+
+@torch._dynamo.disable
+def record_layer_weights_magnitude(param_name, value, layer_idx):  # 🔍
+    for name, p in [
+        (string, int(re.search(r"weights_magnitude_l(\d+)", string).group(1)))
+        for string in ANALYSIS_TYPE
+        if re.search(r"weights_magnitude_l(\d+)", string)
+    ]:
+        if name not in ANALYSIS_CACHE_STATIC:
+            ANALYSIS_CACHE_STATIC[name] = {}
+        if layer_idx not in ANALYSIS_CACHE_STATIC[name]:
+            ANALYSIS_CACHE_STATIC[name][layer_idx] = {}
+        pow_value = torch.pow(value.abs(), p)  # take the abs first
+        ANALYSIS_CACHE_STATIC[name][layer_idx][param_name] = (pow_value.min().cpu(), pow_value.mean().cpu(), pow_value.max().cpu())  # calculate the min, mean and max
 
 
 class DeepseekV2MLP(nn.Module):
@@ -240,7 +255,7 @@ class DeepseekV2MoE(nn.Module):
             if ANALYSIS_MODULE_LOADED:  # 🔍
                 if self.tp_size > 1:  # reduce ahead for accurate recording
                     shared_output = tensor_model_parallel_all_reduce(shared_output)
-                record_layer_magnitude("shared_experts_outputs", shared_output, self.layer_idx)
+                record_layer_activation_magnitude("shared_experts_outputs", shared_output, self.layer_idx)
 
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
@@ -256,7 +271,7 @@ class DeepseekV2MoE(nn.Module):
         if ANALYSIS_MODULE_LOADED:  # 🔍
             if self.tp_size > 1:  # reduce ahead for accurate recording
                 final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
-            record_layer_magnitude("routed_experts_outputs", final_hidden_states, self.layer_idx)
+            record_layer_activation_magnitude("routed_experts_outputs", final_hidden_states, self.layer_idx)
 
         if shared_output is not None:
             if hidden_states.dtype != torch.float16:
@@ -659,7 +674,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 hidden_states, residual)
 
         if ANALYSIS_MODULE_LOADED:  # 🔍
-            record_layer_magnitude("attn_residual", residual, self.layer_idx)
+            record_layer_activation_magnitude("attn_residual", residual, self.layer_idx)
 
         hidden_states = self.self_attn(
             positions=positions,
@@ -667,8 +682,8 @@ class DeepseekV2DecoderLayer(nn.Module):
         )
 
         if ANALYSIS_MODULE_LOADED:  # 🔍
-            record_layer_magnitude("attn_outputs", hidden_states, self.layer_idx)
-            record_layer_magnitude("attn_residual_outputs", hidden_states + residual.to(torch.float32), self.layer_idx)
+            record_layer_activation_magnitude("attn_outputs", hidden_states, self.layer_idx)
+            record_layer_activation_magnitude("attn_residual_outputs", hidden_states + residual.to(torch.float32), self.layer_idx)
 
         # Fully Connected
         if isinstance(self.mlp, DeepseekV2MoE) and \
@@ -679,7 +694,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states, residual)
 
         if ANALYSIS_MODULE_LOADED:  # 🔍
-            record_layer_magnitude("mlp_residual", residual, self.layer_idx)
+            record_layer_activation_magnitude("mlp_residual", residual, self.layer_idx)
 
         hidden_states = self.mlp(hidden_states)
         if isinstance(self.mlp, DeepseekV2MLP) and \
@@ -689,8 +704,8 @@ class DeepseekV2DecoderLayer(nn.Module):
             residual *= 1. / self.routed_scaling_factor
 
         if ANALYSIS_MODULE_LOADED:  # 🔍
-            record_layer_magnitude("mlp_outputs", hidden_states, self.layer_idx)
-            record_layer_magnitude("mlp_residual", hidden_states + residual.to(torch.float32), self.layer_idx)
+            record_layer_activation_magnitude("mlp_outputs", hidden_states, self.layer_idx)
+            record_layer_activation_magnitude("mlp_residual", hidden_states + residual.to(torch.float32), self.layer_idx)
 
         return hidden_states, residual
 
@@ -942,20 +957,26 @@ class DeepseekV2ForCausalLM(nn.Module, SupportsPP):
             loaded_params.add(name)
 
         if ANALYSIS_MODULE_LOADED:  # 🔍
-            if analysis_utils.ANALYSIS_ENABLED and "router_weights" in ANALYSIS_TYPE:
+            if not analysis_utils.ANALYSIS_ENABLED:
+                pass
+            elif ANALYSIS_TYPE is None:
+                pass
+            else:
                 for layer_idx, decoder in enumerate(self.model.layers):
-                    if isinstance(decoder.mlp, DeepseekV2MoE):
-                        record_layer_weights("router_weights", decoder.mlp.gate.__dict__["_parameters"]["weight"].data, layer_idx)
+                    if "router_weights" in ANALYSIS_TYPE:
+                        if isinstance(decoder.mlp, DeepseekV2MoE):
+                            record_layer_weights("router_weights", decoder.mlp.gate.weight.data, layer_idx)
 
-            if analysis_utils.ANALYSIS_ENABLED and "router_bias" in ANALYSIS_TYPE:
-                for layer_idx, decoder in enumerate(self.model.layers):
-                    if isinstance(decoder.mlp, DeepseekV2MoE) and isinstance(decoder.mlp.gate.e_score_correction_bias, nn.Parameter):
-                        record_layer_weights("router_bias", decoder.mlp.gate.e_score_correction_bias.data, layer_idx)
+                    if "router_bias" in ANALYSIS_TYPE:
+                        if isinstance(decoder.mlp, DeepseekV2MoE) and isinstance(decoder.mlp.gate.e_score_correction_bias, nn.Parameter):
+                            record_layer_weights("router_bias", decoder.mlp.gate.e_score_correction_bias.data, layer_idx)
 
-            if analysis_utils.ANALYSIS_ENABLED and "norm_weights" in ANALYSIS_TYPE:
-                for layer_idx, decoder in enumerate(self.transformer.encoder.layers):
-                    record_layer_weights("pre_attn_norm_weight", decoder.input_layernorm.weight.data, layer_idx)
-                    record_layer_weights("pre_mlp_norm_weight", decoder.post_attention_layernorm.weight.data, layer_idx)
+                    if "layernorm_weights" in ANALYSIS_TYPE:
+                        record_layer_weights("pre_attn_norm_weight", decoder.input_layernorm.weight.data, layer_idx)
+                        record_layer_weights("pre_mlp_norm_weight", decoder.post_attention_layernorm.weight.data, layer_idx)
+
+                    for param_name, param in decoder.named_parameters():
+                        record_layer_weights_magnitude(param_name, param.data, layer_idx)
 
         return loaded_params
 
