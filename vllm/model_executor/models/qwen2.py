@@ -23,6 +23,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Inference-only Qwen2 model compatible with HuggingFace weights."""
+import math
 from typing import Iterable, Optional, Set, Tuple, Union
 
 import torch
@@ -57,6 +58,27 @@ from .utils import (AutoWeightsLoader, PPMissingLayer, WeightsMapper,
                     is_pp_missing_parameter,
                     make_empty_intermediate_tensors_factory, make_layers,
                     maybe_prefix)
+from vllm.model_executor.analysis_record import (
+    record_value,
+    record_layer_activation_magnitude,
+    record_layer_weights,
+    record_layer_weights_magnitude,
+)
+
+try:  # 🔍
+    import analysis_utils
+    from analysis_utils import (
+        PID,
+        ANALYSIS_TYPE,
+        ANALYSIS_ARGS,
+        ANALYSIS_CACHE_DYNAMIC,
+        ANALYSIS_CACHE_STATIC,
+    )
+    ANALYSIS_MODULE_LOADED = True
+except Exception as e:
+    import os
+    PID = os.getpid()
+    ANALYSIS_MODULE_LOADED = False
 
 logger = init_logger(__name__)
 
@@ -202,6 +224,7 @@ class Qwen2DecoderLayer(nn.Module):
             attn_type = AttentionType.DECODER
         else:
             attn_type = AttentionType.ENCODER_ONLY
+        self.layer_idx = int(prefix.split(".")[-1])  # 🔍
 
         self.self_attn = Qwen2Attention(
             hidden_size=self.hidden_size,
@@ -240,15 +263,32 @@ class Qwen2DecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(
                 hidden_states, residual)
+
+        if ANALYSIS_MODULE_LOADED:  # 🔍
+            record_layer_activation_magnitude("attn_residual", residual, self.layer_idx)
+
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
         )
 
+        if ANALYSIS_MODULE_LOADED:  # 🔍
+            record_layer_activation_magnitude("attn_outputs", hidden_states, self.layer_idx)
+            record_layer_activation_magnitude("attn_residual_outputs", hidden_states + residual.to(torch.float32), self.layer_idx)
+
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
+
+        if ANALYSIS_MODULE_LOADED:  # 🔍
+            record_layer_activation_magnitude("mlp_residual", residual, self.layer_idx)
+
         hidden_states = self.mlp(hidden_states)
+
+        if ANALYSIS_MODULE_LOADED:  # 🔍
+            record_layer_activation_magnitude("mlp_outputs", hidden_states, self.layer_idx)
+            record_layer_activation_magnitude("mlp_residual", hidden_states + residual.to(torch.float32), self.layer_idx)
+
         return hidden_states, residual
 
 
@@ -324,6 +364,9 @@ class Qwen2Model(nn.Module):
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
+        if ANALYSIS_MODULE_LOADED:  # 🔍
+            record_value("input_ids", input_ids)
+
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -459,6 +502,18 @@ class Qwen2ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
+        if ANALYSIS_MODULE_LOADED and analysis_utils.ANALYSIS_ENABLED:  # 🔍
+            if not torch.any(input_ids):
+                ANALYSIS_CACHE_DYNAMIC.append(None)  # not analyze for the sanity checking step
+            else:
+                if "recorded_tokens" not in ANALYSIS_ARGS:
+                    ANALYSIS_ARGS["recorded_tokens"] = 0
+                ANALYSIS_ARGS["recorded_tokens"] += input_ids.numel()
+                if ANALYSIS_ARGS["recorded_tokens"] <= ANALYSIS_ARGS.get("max_tokens", math.inf):
+                    ANALYSIS_CACHE_DYNAMIC.append({})
+                else:
+                    ANALYSIS_CACHE_DYNAMIC.append(None)  # not analyze when the number of tokens exceeds the limit
+
         hidden_states = self.model(input_ids, positions, intermediate_tensors,
                                    inputs_embeds)
         return hidden_states
@@ -487,7 +542,23 @@ class Qwen2ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
             skip_prefixes=(["lm_head."]
                            if self.config.tie_word_embeddings else None),
         )
-        return loader.load_weights(weights)
+        autoloaded_weights = loader.load_weights(weights)
+
+        if ANALYSIS_MODULE_LOADED:  # 🔍
+            if not analysis_utils.ANALYSIS_ENABLED:
+                pass
+            elif ANALYSIS_TYPE is None:
+                pass
+            else:
+                for layer_idx, decoder in enumerate(self.model.layers):
+                    if "layernorm_weights" in ANALYSIS_TYPE:
+                        record_layer_weights("pre_attn_norm_weight", decoder.input_layernorm.weight.data, layer_idx)
+                        record_layer_weights("pre_mlp_norm_weight", decoder.post_attention_layernorm.weight.data, layer_idx)
+
+                    for param_name, param in decoder.named_parameters():
+                        record_layer_weights_magnitude(param_name, param.data, layer_idx)
+
+        return autoloaded_weights
 
 
 class Qwen2EmbeddingModel(nn.Module, SupportsLoRA, SupportsPP):

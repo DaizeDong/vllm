@@ -58,11 +58,11 @@ from .utils import (PPMissingLayer, is_pp_missing_parameter,
                     make_empty_intermediate_tensors_factory, make_layers,
                     maybe_prefix)
 from vllm.model_executor.analysis_record import (
-    record_layer_activation_magnitude,
+    record_value,
     record_layer_value,
+    record_layer_activation_magnitude,
     record_layer_weights,
     record_layer_weights_magnitude,
-    record_value
 )
 
 try:  # 🔍
