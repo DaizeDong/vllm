@@ -65,7 +65,9 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         expert_map: Optional[torch.Tensor] = None,
         custom_routing_function: Optional[Callable] = None,
         scoring_func: str = "softmax",
-        e_score_correction_bias: Optional[torch.Tensor] = None
+        e_score_correction_bias: Optional[torch.Tensor] = None,
+        apply_router_weight_on_input: bool = False,
+        activation: str = "silu",
     ) -> torch.Tensor:
         raise NotImplementedError
 
@@ -156,24 +158,28 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         custom_routing_function: Optional[Callable] = None,
         scoring_func: str = "softmax",
         e_score_correction_bias: Optional[torch.Tensor] = None,
+        apply_router_weight_on_input: bool = False,
         activation: str = "silu",
         layer_idx: Optional[int] = None,  # 🔍
     ) -> torch.Tensor:
-        return self.forward(x=x,
-                            layer=layer,
-                            router_logits=router_logits,
-                            top_k=top_k,
-                            renormalize=renormalize,
-                            use_grouped_topk=use_grouped_topk,
-                            topk_group=topk_group,
-                            num_expert_group=num_expert_group,
-                            global_num_experts=global_num_experts,
-                            expert_map=expert_map,
-                            custom_routing_function=custom_routing_function,
-                            scoring_func=scoring_func,
-                            e_score_correction_bias=e_score_correction_bias,
-                            activation=activation,
-                            layer_idx=layer_idx)  # 🔍
+        return self.forward(
+            x=x,
+            layer=layer,
+            router_logits=router_logits,
+            top_k=top_k,
+            renormalize=renormalize,
+            use_grouped_topk=use_grouped_topk,
+            topk_group=topk_group,
+            num_expert_group=num_expert_group,
+            global_num_experts=global_num_experts,
+            expert_map=expert_map,
+            custom_routing_function=custom_routing_function,
+            scoring_func=scoring_func,
+            e_score_correction_bias=e_score_correction_bias,
+            activation=activation,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            layer_idx=layer_idx,  # 🔍
+        )
 
     def forward_cuda(
         self,
@@ -190,6 +196,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         custom_routing_function: Optional[Callable] = None,
         scoring_func: str = "softmax",
         e_score_correction_bias: Optional[torch.Tensor] = None,
+        apply_router_weight_on_input: bool = False,
         activation: str = "silu",
         layer_idx: Optional[int] = None,  # 🔍
     ) -> torch.Tensor:
@@ -207,15 +214,17 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             layer_idx=layer_idx)  # 🔍
 
 
-        return fused_experts(hidden_states=x,
-                             w1=layer.w13_weight,
-                             w2=layer.w2_weight,
-                             topk_weights=topk_weights,
-                             topk_ids=topk_ids,
-                             inplace=True,
-                             activation=activation,
-                             global_num_experts=global_num_experts,
-                             expert_map=expert_map)
+        return fused_experts(
+            hidden_states=x,
+            w1=layer.w13_weight,
+            w2=layer.w2_weight,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            inplace=True,
+            activation=activation,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            global_num_experts=global_num_experts,
+            expert_map=expert_map)
 
     def forward_cpu(
         self,
@@ -233,9 +242,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         scoring_func: str = "softmax",
         e_score_correction_bias: Optional[torch.Tensor] = None,
         activation: str = "silu",
+        apply_router_weight_on_input: bool = False,
         **kwargs,
     ):
         assert activation == "silu", f"{activation} is not supported."
+        assert apply_router_weight_on_input is False
         return layer.ipex_fusion(
             x,
             use_grouped_topk,
@@ -259,15 +270,20 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         renormalize: bool,
         topk_group: Optional[int] = None,
         num_expert_group: Optional[int] = None,
+        global_num_experts: int = -1,
+        expert_map: Optional[torch.Tensor] = None,
         custom_routing_function: Optional[Callable] = None,
         scoring_func: str = "softmax",
-        e_score_correction_bias: Optional[torch.Tensor] = None
+        e_score_correction_bias: Optional[torch.Tensor] = None,
+        apply_router_weight_on_input: bool = False,
+        activation: str = "silu",
     ) -> torch.Tensor:
         assert not use_grouped_topk
         assert num_expert_group is None
         assert topk_group is None
         assert custom_routing_function is None
         assert layer is not None
+        assert apply_router_weight_on_input is False
         if scoring_func != "softmax":
             raise NotImplementedError(
                 "Only softmax scoring function is supported for HPU.")
@@ -292,12 +308,14 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         custom_routing_function: Optional[Callable] = None,
         scoring_func: str = "softmax",
         e_score_correction_bias: Optional[torch.Tensor] = None,
+        apply_router_weight_on_input: bool = False,
         activation: str = "silu",
     ) -> torch.Tensor:
         assert not use_grouped_topk
         assert num_expert_group is None
         assert topk_group is None
         assert custom_routing_function is None
+        assert apply_router_weight_on_input is False
         if scoring_func != "softmax":
             raise NotImplementedError(
                 "Only softmax scoring function is supported for TPU.")
@@ -314,7 +332,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                                 expert_map=expert_map,
                                 renormalize=renormalize)
 
-    forward_native = forward_tpu if current_platform.is_tpu else forward_cuda
+    forward_native = forward_tpu if current_platform.is_tpu() else forward_cuda
 
 
 def determine_expert_map(
@@ -403,6 +421,7 @@ class FusedMoE(torch.nn.Module):
         custom_routing_function: Optional[Callable] = None,
         scoring_func: str = "softmax",
         e_score_correction_bias: Optional[torch.Tensor] = None,
+        apply_router_weight_on_input: bool = False,
         activation: str = "silu",
         layer_idx: Optional[int] = None,  # 🔍
     ):
@@ -425,7 +444,7 @@ class FusedMoE(torch.nn.Module):
         # Use expert parallelism instead of tensor parallelism?
         vllm_config = get_current_vllm_config()
         use_ep = (vllm_config.parallel_config.enable_expert_parallel
-                  and self.tp_size > 1)
+                  and self.tp_size * self.dp_size > 1)
 
         # For smuggling this layer into the fused moe custom op
         self.use_direct_call = self.dp_size == 1
@@ -479,7 +498,7 @@ class FusedMoE(torch.nn.Module):
                              "non-grouped topk.")
         if current_platform.is_hpu():
             from vllm_hpu_extension.ops import DynamicFusedMOE
-            self.hpu_fused_moe = DynamicFusedMOE(self.num_experts)
+            self.hpu_fused_moe = DynamicFusedMOE(self.global_num_experts)
 
         # Note: get_quant_method will look at the layer's local_num_experts
         # for heuristic purposes, so it must be initialized first.
@@ -490,6 +509,7 @@ class FusedMoE(torch.nn.Module):
             self.quant_method = quant_config.get_quant_method(self, prefix)
         assert self.quant_method is not None
 
+        self.apply_router_weight_on_input = apply_router_weight_on_input
         moe_quant_params = {
             "num_experts": self.local_num_experts,
             "hidden_size": hidden_size,
@@ -862,7 +882,9 @@ class FusedMoE(torch.nn.Module):
             scoring_func=self.scoring_func,
             e_score_correction_bias=self.e_score_correction_bias,
             activation=self.activation,
-            layer_idx=self.layer_idx)  # 🔍
+            apply_router_weight_on_input=self.apply_router_weight_on_input,
+            layer_idx=self.layer_idx,  # 🔍
+        )
 
         if self.dp_size > 1:
             start = 0 if self.dp_rank == 0 else cu_tokens_across_dp_cpu[
