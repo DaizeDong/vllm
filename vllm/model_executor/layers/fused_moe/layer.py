@@ -113,12 +113,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         super().process_weights_after_loading(layer)
 
-        layer.w13_weight = torch.nn.Parameter(self._maybe_pad_weight(
-            layer.w13_weight.data),
-                                              requires_grad=False)
-        layer.w2_weight = torch.nn.Parameter(self._maybe_pad_weight(
-            layer.w2_weight.data),
-                                             requires_grad=False)
+        # Padding the weight for better performance on ROCm
+        layer.w13_weight.data = self._maybe_pad_weight(layer.w13_weight.data)
+        layer.w2_weight.data = self._maybe_pad_weight(layer.w2_weight.data)
         # Lazy import to avoid importing triton.
         from vllm.model_executor.layers.fused_moe.rocm_aiter_fused_moe import (
             is_rocm_aiter_moe_enabled, shuffle_weights)
@@ -127,10 +124,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             shuffled_w13, shuffled_w2 = shuffle_weights(
                 layer.w13_weight.data, layer.w2_weight.data)
 
-            layer.w13_weight = torch.nn.Parameter(shuffled_w13,
-                                                  requires_grad=False)
-            layer.w2_weight = torch.nn.Parameter(shuffled_w2,
-                                                 requires_grad=False)
+            layer.w13_weight.data = shuffled_w13
+            layer.w2_weight.data = shuffled_w2
 
         if current_platform.is_cpu():
             if current_platform.get_cpu_architecture() == CpuArchEnum.X86:
@@ -656,7 +651,7 @@ class FusedMoE(torch.nn.Module):
         expert_id = self._map_global_expert_id_to_local_expert_id(expert_id)
         if expert_id == -1:
             return
-
+        quant_method_name = self.quant_method.__class__.__name__
         # compressed-tensors checkpoints with packed weights are stored flipped
         # TODO (mgoin): check self.quant_method.quant_config.quant_format
         # against known CompressionFormat enum values that have this quality
@@ -710,8 +705,9 @@ class FusedMoE(torch.nn.Module):
             # this is needed for compressed-tensors only
             loaded_weight = loaded_weight.to(param.data.device)
 
-            if param.data[expert_id] != 1 and (param.data[expert_id] -
-                                               loaded_weight).abs() > 1e-5:
+            if ("compressed" in quant_method_name.lower()
+                    and param.data[expert_id] != 1
+                    and (param.data[expert_id] - loaded_weight).abs() > 1e-5):
                 raise ValueError(
                     "input_scales of w1 and w3 of a layer "
                     f"must be equal. But got {param.data[expert_id]} "
@@ -729,6 +725,22 @@ class FusedMoE(torch.nn.Module):
                              loaded_weight=loaded_weight,
                              expert_data=expert_data,
                              tp_rank=self.tp_rank)
+            return
+
+        if "ModelOpt" in quant_method_name:
+            if ('weight_scale_2' in weight_name
+                    or 'input_scale' in weight_name):
+                self._load_per_tensor_weight_scale(shard_id=shard_id,
+                                                   param=param,
+                                                   loaded_weight=loaded_weight,
+                                                   expert_id=expert_id)
+            elif "weight" in weight_name:
+                self._load_model_weight_or_group_weight_scale(
+                    shard_id=shard_id,
+                    shard_dim=shard_dim,
+                    loaded_weight=loaded_weight,
+                    expert_data=expert_data,
+                    tp_rank=self.tp_rank)
             return
 
         # Case weight scales, zero_points and offset
@@ -817,11 +829,12 @@ class FusedMoE(torch.nn.Module):
                 e_score_correction_bias=e_score_correction_bias,
                 layer_idx=layer_idx)  # 🔍
         elif custom_routing_function is None:
-            topk_weights, topk_ids = fused_topk(hidden_states=hidden_states,
-                                                gating_output=router_logits,
-                                                topk=top_k,
-                                                renormalize=renormalize,
-                                                layer_idx=layer_idx)  # 🔍
+            topk_weights, topk_ids, token_expert_indices = fused_topk(
+                hidden_states=hidden_states,
+                gating_output=router_logits,
+                topk=top_k,
+                renormalize=renormalize,
+                layer_idx=layer_idx)  # 🔍
         else:
             topk_weights, topk_ids = custom_routing_function(
                 hidden_states=hidden_states,
