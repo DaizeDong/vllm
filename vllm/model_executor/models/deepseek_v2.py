@@ -23,7 +23,8 @@
 # limitations under the License.
 """Inference-only DeepseekV2/DeepseekV3 model."""
 import math
-from typing import Any, Dict, Iterable, Optional, Set, Tuple, Union
+from collections.abc import Iterable
+from typing import Any, Optional, Union
 
 import torch
 from torch import nn
@@ -32,9 +33,7 @@ from transformers import PretrainedConfig
 from vllm.attention import Attention
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, ModelConfig, VllmConfig
-from vllm.distributed import (get_pp_group,
-                              get_tensor_model_parallel_world_size,
-                              tensor_model_parallel_all_reduce)
+from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -177,7 +176,8 @@ class DeepseekV2MoE(nn.Module):
                 intermediate_size=intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
-                reduce_results=False,
+                reduce_results=self.experts.must_reduce_shared_expert_outputs(
+                ),
                 prefix=f"{prefix}.shared_experts",
             )
 
@@ -192,11 +192,12 @@ class DeepseekV2MoE(nn.Module):
 
             if ANALYSIS_MODULE_LOADED:  # 🔍
                 if self.tp_size > 1:  # reduce ahead for accurate recording
-                    shared_output = tensor_model_parallel_all_reduce(shared_output)
+                    shared_output = self.experts.maybe_all_reduce_tensor_model_parallel(shared_output)
                 record_layer_activation_magnitude("shared_experts_outputs", shared_output, self.layer_idx)
 
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
+
         if hidden_states.dtype != torch.float16:
             final_hidden_states = self.experts(
                 hidden_states=hidden_states,
@@ -209,7 +210,7 @@ class DeepseekV2MoE(nn.Module):
 
         if ANALYSIS_MODULE_LOADED:  # 🔍
             if self.tp_size > 1:  # reduce ahead for accurate recording
-                final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+                final_hidden_states = self.experts.maybe_all_reduce_tensor_model_parallel(final_hidden_states)
             record_layer_activation_magnitude("routed_experts_outputs", final_hidden_states, self.layer_idx)
 
         if shared_output is not None:
@@ -223,7 +224,9 @@ class DeepseekV2MoE(nn.Module):
 
         if not ANALYSIS_MODULE_LOADED:  # 🔍
             if self.tp_size > 1:
-                final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+                final_hidden_states = (
+                    self.experts.maybe_all_reduce_tensor_model_parallel(
+                        final_hidden_states))
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
@@ -248,7 +251,7 @@ class DeepseekV2Attention(nn.Module):
         q_lora_rank: int,
         kv_lora_rank: int,
         rope_theta: float = 10000,
-        rope_scaling: Optional[Dict[str, Any]] = None,
+        rope_scaling: Optional[dict[str, Any]] = None,
         max_position_embeddings: int = 8192,
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
@@ -402,7 +405,7 @@ class DeepseekV2MLAAttention(nn.Module):
         q_lora_rank: Optional[int],
         kv_lora_rank: int,
         rope_theta: float = 10000,
-        rope_scaling: Optional[Dict[str, Any]] = None,
+        rope_scaling: Optional[dict[str, Any]] = None,
         max_position_embeddings: int = 8192,
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
@@ -819,8 +822,8 @@ class DeepseekV2ForCausalLM(nn.Module, SupportsPP):
                         device=device),
         })
 
-    def load_weights(self, weights: Iterable[Tuple[str,
-                                                   torch.Tensor]]) -> Set[str]:
+    def load_weights(self, weights: Iterable[tuple[str,
+                                                   torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("gate_up_proj", "gate_proj", 0),
@@ -836,7 +839,7 @@ class DeepseekV2ForCausalLM(nn.Module, SupportsPP):
             num_experts=self.config.n_routed_experts)
 
         params_dict = dict(self.named_parameters())
-        loaded_params: Set[str] = set()
+        loaded_params: set[str] = set()
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
