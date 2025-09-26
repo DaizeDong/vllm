@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Iterable, Mapping, Sequence
-from typing import Optional, TypedDict, Union
+from typing import Annotated, Optional, Union
 
 import torch
 import torch.nn as nn
@@ -18,16 +19,16 @@ from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader, maybe_remap_kv_scale_name)
-from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (MultiModalDataDict, MultiModalFieldConfig,
-                                    MultiModalKwargs)
+                                    MultiModalKwargsItems)
 from vllm.multimodal.parse import MultiModalDataItems
 from vllm.multimodal.processing import (BaseMultiModalProcessor,
                                         BaseProcessingInfo, PromptReplacement,
                                         PromptUpdate)
 from vllm.multimodal.profiling import BaseDummyInputsBuilder
 from vllm.sequence import IntermediateTensors
+from vllm.utils.tensor_schema import TensorSchema, TensorShape
 
 # yapf: disable
 from .idefics2_vision_model import Idefics2VisionConfig
@@ -41,14 +42,25 @@ from .utils import (AutoWeightsLoader, WeightsMapper, flatten_bn,
                     merge_multimodal_embeddings)
 
 
-class AriaImagePixelInputs(TypedDict):
-    pixel_values: torch.Tensor
-    pixel_mask: Optional[torch.Tensor]
+class AriaImagePixelInputs(TensorSchema):
     """
-    Shape:
-        pixel_values: `(batch_size * num_images, num_channels, height, width)`
-        pixel_mask: `(batch_size * num_images, height, width)`
+    Dimensions:
+        - b: Batch size
+        - n: Number of images
+        - c: Number of channels
+        - h: Height of each image
+        - w: Width of each image
     """
+
+    pixel_values: Annotated[
+        torch.Tensor,
+        TensorShape("bn", 3, "h", "w"),
+    ]
+
+    pixel_mask: Annotated[
+        Optional[torch.Tensor],
+        TensorShape("bn", "h", "w"),
+    ]
 
 
 class AriaVisionTransformer(Idefics3VisionTransformer, SupportsQuant):
@@ -130,16 +142,8 @@ class AriaProjector(nn.Module):
     projects ViT's outputs into MoE's inputs.
 
     Args:
-        patch_to_query_dict (dict): Maps patch numbers to their corresponding
-        query numbers,
-            e.g., {1225: 128, 4900: 256}. This allows for different query sizes
-            based on image resolution.
-        embed_dim (int): Embedding dimension.
-        num_heads (int): Number of attention heads.
-        kv_dim (int): Dimension of key and value.
-        ff_dim (int): Hidden dimension of the feed-forward network.
-        output_dim (int): Output dimension.
-        norm_layer (nn.Module): Normalization layer. Default is nn.LayerNorm.
+        config: [AriaConfig](https://huggingface.co/docs/transformers/main/model_doc/aria#transformers.AriaConfig)
+            containing projector configuration parameters.
 
     Outputs:
         A tensor with the shape of (batch_size, query_number, output_dim)
@@ -269,8 +273,8 @@ class AriaTextMoELayer(nn.Module):
         Forward pass of the MoE Layer.
 
         Args:
-            hidden_states (torch.Tensor): Input tensor of shape (batch_size,
-            sequence_length, hidden_size).
+            hidden_states: Input tensor of shape
+                (batch_size, sequence_length, hidden_size).
 
         Returns:
             torch.Tensor: Output tensor after passing through the MoE layer.
@@ -457,7 +461,7 @@ class AriaMultiModalProcessor(BaseMultiModalProcessor[AriaProcessingInfo]):
         self,
         mm_items: MultiModalDataItems,
         hf_processor_mm_kwargs: Mapping[str, object],
-        out_mm_kwargs: MultiModalKwargs,
+        out_mm_kwargs: MultiModalKwargsItems,
     ) -> Sequence[PromptUpdate]:
         hf_config = self.info.get_hf_config()
         image_token_id = hf_config.image_token_index
@@ -485,6 +489,11 @@ class AriaForConditionalGeneration(nn.Module, SupportsMultiModal):
     """
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={
+            # mapping for new names in checkpoint saved after transformers v4.52
+            "model.language_model.": "language_model.model.",
+            "model.vision_tower.": "vision_tower.",
+            "model.multi_modal_projector.": "multi_modal_projector.",
+            # mapping for original checkpoint
             "language_model.model": "language_model",
             "language_model.lm_head": "lm_head",
         },
@@ -492,6 +501,13 @@ class AriaForConditionalGeneration(nn.Module, SupportsMultiModal):
             "router.weight": "router_weight",
         },
     )
+
+    @classmethod
+    def get_placeholder_str(cls, modality: str, i: int) -> Optional[str]:
+        if modality.startswith("image"):
+            return "<|fim_prefix|><|img|><|fim_suffix|>"
+
+        raise ValueError("Only image modality is supported")
 
     def __init__(
         self,
@@ -522,16 +538,11 @@ class AriaForConditionalGeneration(nn.Module, SupportsMultiModal):
             config.text_config.hidden_size,
             org_num_embeddings=self.language_model.org_vocab_size,
             quant_config=quant_config,
+            prefix=maybe_prefix(prefix, "lm_head"),
         )
         logit_scale = getattr(config, "logit_scale", 1.0)
         self.logits_processor = LogitsProcessor(self.unpadded_vocab_size,
                                                 self.vocab_size, logit_scale)
-
-    def _validate_image_sizes(
-            self, images: list[torch.Tensor]) -> list[torch.Tensor]:
-        if not all(img.shape == images[0].shape for img in images):
-            raise ValueError("All images must be the same size")
-        return images
 
     def _parse_and_validate_image_input(
             self, **kwargs: object) -> Optional[AriaImagePixelInputs]:
@@ -541,23 +552,9 @@ class AriaForConditionalGeneration(nn.Module, SupportsMultiModal):
         if pixel_values is None:
             return None
 
-        if not isinstance(pixel_values, (torch.Tensor, list)):
-            raise ValueError("Incorrect type of pixel values. "
-                             f"Got type: {type(pixel_values)}")
-
-        pixel_values = self._validate_image_sizes(pixel_values)
-        pixel_values = flatten_bn(pixel_values, concat=True)
-
-        if pixel_mask is not None:
-            if not isinstance(pixel_mask, (torch.Tensor, list)):
-                raise ValueError("Incorrect type of pixel mask. "
-                                 f"Got type: {type(pixel_mask)}")
-
-            pixel_mask = flatten_bn(pixel_mask, concat=True)
-
         return AriaImagePixelInputs(
-            pixel_values=pixel_values,
-            pixel_mask=pixel_mask,
+            pixel_values=flatten_bn(pixel_values, concat=True),
+            pixel_mask=flatten_bn(pixel_mask, concat=True),
         )
 
     def _create_patch_attention_mask(
@@ -600,11 +597,11 @@ class AriaForConditionalGeneration(nn.Module, SupportsMultiModal):
     def get_language_model(self) -> torch.nn.Module:
         return self.language_model
 
-    def get_multimodal_embeddings(
-            self, **kwargs: object) -> Optional[MultiModalEmbeddings]:
+    def get_multimodal_embeddings(self,
+                                  **kwargs: object) -> MultiModalEmbeddings:
         image_input = self._parse_and_validate_image_input(**kwargs)
         if image_input is None:
-            return None
+            return []
         multimodal_embeddings = self._process_image_input(image_input)
         return multimodal_embeddings
 
@@ -614,7 +611,8 @@ class AriaForConditionalGeneration(nn.Module, SupportsMultiModal):
         multimodal_embeddings: Optional[MultiModalEmbeddings] = None,
     ) -> torch.Tensor:
         inputs_embeds = self.language_model.get_input_embeddings(input_ids)
-        if multimodal_embeddings is not None:
+        if multimodal_embeddings is not None \
+            and len(multimodal_embeddings) != 0:
             inputs_embeds = merge_multimodal_embeddings(
                 input_ids, inputs_embeds, multimodal_embeddings,
                 self.config.image_token_index)
@@ -645,10 +643,8 @@ class AriaForConditionalGeneration(nn.Module, SupportsMultiModal):
 
         return hidden_states
 
-    def compute_logits(self, hidden_states: torch.Tensor,
-                       sampling_metadata: SamplingMetadata) -> torch.Tensor:
-        logits = self.logits_processor(self.lm_head, hidden_states,
-                                       sampling_metadata)
+    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):

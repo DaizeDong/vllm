@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 # Copyright (c) 2024, Tri Dao, Albert Gu.
 # Adapted from https://github.com/state-spaces/mamba/blob/v2.2.4/mamba_ssm/ops/triton/ssd_chunk_state.py
@@ -16,7 +17,6 @@ from .mamba_ssm import softplus
 
 @triton.autotune(
     configs=[
-        triton.Config({'BLOCK_SIZE_H': 1}),
         triton.Config({'BLOCK_SIZE_H': 2}),
         triton.Config({'BLOCK_SIZE_H': 4}),
         triton.Config({'BLOCK_SIZE_H': 8}),
@@ -501,7 +501,7 @@ def _chunk_state_varlen_kernel(
         dA_cumsum_ptrs += BLOCK_SIZE_K * stride_dA_cs_csize
 
     # If the sequence starts after the last chunk idx, we don't need to add the contribution from the last chunk
-    # If HAS_INITSTATES==True need to consider two possiblties
+    # If HAS_INITSTATES==True need to consider two possibilities
     # - if start_idx < pid_c * chunk_size, then we need to take the past_states_ptrs
     # - if state_idx >= pid * chunk_size, then we need to insert initstates
     if ((start_idx < pid_c * chunk_size)  # first chunk
@@ -515,7 +515,7 @@ def _chunk_state_varlen_kernel(
                 offs_n[None, :] * stride_chunk_states_dstate)
         else:
 
-            # - this seems repetitve, buts its to help the compiler
+            # - this seems repetitive, buts its to help the compiler
             if start_idx < pid_c * chunk_size:
                 past_states_ptrs = chunk_states_ptr + (
                     offs_m[:, None] * stride_chunk_states_hdim +

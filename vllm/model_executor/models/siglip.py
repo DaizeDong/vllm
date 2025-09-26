@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Implementation of SiglipVisionModel intended to be only used
 within a vision language model."""
 
@@ -19,7 +20,8 @@ from vllm.model_executor.layers.linear import (ColumnParallelLinear,
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding)
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.model_loader.weight_utils import (
+    default_weight_loader, maybe_remap_kv_scale_name)
 
 from .vision import VisionEncoderInfo, resolve_visual_encoder_outputs
 
@@ -130,11 +132,10 @@ class SiglipVisionEmbeddings(nn.Module):
         embeddings = patch_embeds.flatten(2).transpose(1, 2)
 
         if interpolate_pos_encoding:
-            embeddings = embeddings + self.interpolate_pos_encoding(
+            embeddings += self.interpolate_pos_encoding(
                 embeddings, height, width)
         else:
-            embeddings = embeddings + self.position_embedding(
-                self.position_ids)
+            embeddings += self.position_embedding(self.position_ids)
         return embeddings
 
 
@@ -271,12 +272,12 @@ class SiglipEncoderLayer(nn.Module):
 
         hidden_states = self.layer_norm1(hidden_states)
         hidden_states, _ = self.self_attn(hidden_states=hidden_states)
-        hidden_states = residual + hidden_states
+        hidden_states += residual
 
         residual = hidden_states
         hidden_states = self.layer_norm2(hidden_states)
         hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
+        hidden_states += residual
 
         return hidden_states, None
 
@@ -354,7 +355,8 @@ class SiglipMultiheadAttentionPoolingHead(nn.Module):
 
         residual = hidden_state
         hidden_state = self.layernorm(hidden_state)
-        hidden_state = residual + self.mlp(hidden_state)
+        hidden_state = self.mlp(hidden_state)
+        hidden_state += residual
 
         return hidden_state[:, 0]
 
@@ -504,6 +506,21 @@ class SiglipVisionModel(nn.Module):
                 layer_idx = int(name.split(".")[3])
                 if layer_idx >= layer_count:
                     continue
+
+            # Check if this is a scale parameter that needs remapping first
+            if name.endswith(
+                (".k_scale", ".v_scale", ".q_scale", ".prob_scale")):
+                # Try to remap the scale name first
+                remapped_name = maybe_remap_kv_scale_name(name, params_dict)
+                if remapped_name is not None and remapped_name in params_dict:
+                    # Successfully remapped, use the remapped name
+                    param = params_dict[remapped_name]
+                    weight_loader = getattr(param, "weight_loader",
+                                            default_weight_loader)
+                    weight_loader(param, loaded_weight)
+                    loaded_params.add(remapped_name)
+                    continue
+                # If remapping failed, continue with normal processing
 
             for (param_name, weight_name, shard_id) in stacked_params_mapping:
                 if weight_name not in name:

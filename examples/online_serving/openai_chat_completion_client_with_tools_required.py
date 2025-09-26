@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
 To run this example, you can start the vLLM server
 without any specific flags:
 
 ```bash
 VLLM_USE_V1=0 vllm serve unsloth/Llama-3.2-1B-Instruct \
-    --guided-decoding-backend outlines
+    --structured-outputs-config.backend outlines
 ```
 
 This example demonstrates how to generate chat completions

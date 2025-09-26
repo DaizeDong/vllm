@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
 This example shows how to use the multi-LoRA functionality
 for offline inference.
@@ -22,7 +23,7 @@ def create_test_prompts(
     2 requests for base model, 4 requests for the LoRA. We define 2
     different LoRA adapters (using the same model for demo purposes).
     Since we also set `max_loras=1`, the expectation is that the requests
-    with the second LoRA adapter will be ran after all requests with the
+    with the second LoRA adapter will be run after all requests with the
     first adapter have finished.
     """
     return [

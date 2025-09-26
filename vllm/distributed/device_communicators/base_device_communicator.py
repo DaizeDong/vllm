@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import threading
-from typing import Optional
+from typing import Optional, Union
 from weakref import WeakValueDictionary
 
 import torch
@@ -48,8 +49,7 @@ class All2AllManagerBase:
 
         # all2all communication often has separate implementations for
         # intra-node and inter-node communication
-        self.intranode = in_the_same_node_as(cpu_group, source_rank=0)
-        self.internode = not self.intranode
+        self.internode = not all(in_the_same_node_as(cpu_group, source_rank=0))
 
     def get_handle(self, kwargs):
         # get a handle for the all2all communication,
@@ -59,6 +59,12 @@ class All2AllManagerBase:
         # usually the underlying implementation caches the handle
         # and reuse it for the same config.
         raise NotImplementedError
+
+    def set_num_sms(self, num_sms: int):
+        pass
+
+    def max_sms_used(self) -> Optional[int]:
+        return None  # None means it could use the whole GPU
 
     def dispatch(self, hidden_states: torch.Tensor,
                  router_logits: torch.Tensor):
@@ -105,7 +111,8 @@ class DeviceCommunicatorBase:
             # we initialize the all2all manager used in expert parallel.
             use_ep = config.parallel_config.data_parallel_size > 1
 
-        self.use_all2all = "ep" in unique_name and use_ep
+        self.is_ep_communicator = "ep" in unique_name
+        self.use_all2all = self.is_ep_communicator and use_ep
         self.all2all_manager: Optional[All2AllManagerBase] = None
 
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
@@ -137,6 +144,14 @@ class DeviceCommunicatorBase:
                                                input_size[dim], ) +
                                               input_size[dim + 1:])
         return output_tensor
+
+    def all_gatherv(
+        self,
+        input_: Union[torch.Tensor, list[torch.Tensor]],
+        dim: int = 0,
+        sizes: Optional[list[int]] = None
+    ) -> Union[torch.Tensor, list[torch.Tensor]]:
+        raise NotImplementedError
 
     def reduce_scatter(self,
                        input_: torch.Tensor,
@@ -172,6 +187,12 @@ class DeviceCommunicatorBase:
         # Reshape before returning
         return output_tensor.movedim(0, dim).contiguous()
 
+    def reduce_scatterv(self,
+                        input_: torch.Tensor,
+                        dim: int = -1,
+                        sizes: Optional[list[int]] = None) -> torch.Tensor:
+        raise NotImplementedError
+
     def gather(self,
                input_: torch.Tensor,
                dst: int = 0,
@@ -205,7 +226,7 @@ class DeviceCommunicatorBase:
         return output_tensor
 
     def send(self, tensor: torch.Tensor, dst: Optional[int] = None) -> None:
-        """Sends a tensor to the destination rank in a non-blocking way"""
+        """Sends a tensor to the destination rank in a blocking way"""
         """NOTE: `dst` is the local rank of the destination rank."""
         if dst is None:
             dst = (self.rank_in_group + 1) % self.world_size
@@ -232,16 +253,18 @@ class DeviceCommunicatorBase:
         """
         Prepare the communication buffer for the model.
         """
-        if not self.use_all2all:
+        if not self.is_ep_communicator:
             return
 
         moe_modules = [
             module for module in model.modules()
-            if module.__class__.__name__ == "FusedMoE"
+            # TODO(bnell): Should use isinstance but can't.  Maybe search for
+            # presence of quant_method.init_prepare_finalize?
+            if (module.__class__.__name__ == "FusedMoE"
+                or module.__class__.__name__ == "SharedFusedMoE")
         ]
         for module in moe_modules:
-            module.quant_method.init_prepare_finalize(module.moe_config,
-                                                      module.quant_config)
+            module.quant_method.init_prepare_finalize(module)
 
     def dispatch(
             self, hidden_states: torch.Tensor,

@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import os
 from urllib.request import urlopen
 
 from vllm import LLM, SamplingParams
 
-os.environ["VLLM_ATTENTION_BACKEND"] = "DUAL_CHUNK_FLASH_ATTN"
 os.environ["VLLM_ALLOW_LONG_MAX_MODEL_LEN"] = "1"
 
 

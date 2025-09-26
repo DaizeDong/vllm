@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 # ruff: noqa
 import json
@@ -142,5 +143,5 @@ outputs = llm.chat(messages, sampling_params, tools=tools)
 
 print(outputs[0].outputs[0].text.strip())
 # yields
-#   'The weather in Dallas, TX is 85 degrees fahrenheit. '
+#   'The weather in Dallas, TX is 85 degrees Fahrenheit. '
 #   'It is partly cloudly, with highs in the 90's.'
