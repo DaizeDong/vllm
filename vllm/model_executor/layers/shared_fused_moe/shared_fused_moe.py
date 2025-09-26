@@ -36,6 +36,7 @@ class SharedFusedMoE(FusedMoE):
         router_logits: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if not self.use_overlapped:
+            # 🔍 TODO: Add analysis record if necessary, currently this code snippet is never used.
             shared_out = self._shared_experts(hidden_states)
 
             # Reduce outputs if necessary, since the MLP should

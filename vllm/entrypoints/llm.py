@@ -1601,7 +1601,7 @@ class LLM:
             )
 
         if ANALYSIS_MODULE_LOADED:  # 🔍
-            assert self.llm_engine.parallel_config.pipeline_parallel_size == 1, "Analysis is not supported in pipeline parallelism, please set `PP=1`"
+            assert self.llm_engine.vllm_config.parallel_config.pipeline_parallel_size == 1, "Analysis is not supported in pipeline parallelism, please set `PP=1`"
 
         # Run the engine.
         outputs: list[Union[RequestOutput, PoolingRequestOutput]] = []

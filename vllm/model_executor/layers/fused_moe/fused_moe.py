@@ -42,6 +42,11 @@ from vllm.utils.deep_gemm import is_deep_gemm_e8m0_used
 
 from .rocm_aiter_fused_moe import is_rocm_aiter_moe_enabled
 
+from vllm.model_executor.analysis_record import (
+    record_layer_balance_loss,
+    record_layer_router_scores,
+)
+
 try:  # 🔍
     import analysis_utils
     from analysis_utils import (

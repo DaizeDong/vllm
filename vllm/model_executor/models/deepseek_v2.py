@@ -296,6 +296,7 @@ class DeepseekV2MoE(nn.Module):
                 enable_eplb=self.enable_eplb,
                 num_redundant_experts=self.n_redundant_experts,
                 is_sequence_parallel=self.is_sequence_parallel,
+                layer_idx=layer_idx,  # 🔍
             )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -333,18 +334,33 @@ class DeepseekV2MoE(nn.Module):
             assert shared_output is not None
             shared_output *= (1. / self.routed_scaling_factor)
 
+        if ANALYSIS_MODULE_LOADED:  # 🔍 reduce ahead for accurate recording
+            if self.is_sequence_parallel:
+                if shared_output is not None:
+                    shared_output = tensor_model_parallel_all_gather(shared_output, 0)
+                    shared_output = shared_output[:num_tokens]
+                final_hidden_states = tensor_model_parallel_all_gather(final_hidden_states, 0)
+                final_hidden_states = final_hidden_states[:num_tokens]
+            elif self.tp_size > 1:
+                if shared_output is not None:
+                    shared_output = self.experts.maybe_all_reduce_tensor_model_parallel(shared_output)
+                final_hidden_states = self.experts.maybe_all_reduce_tensor_model_parallel(final_hidden_states)
+            record_layer_activation_magnitude("shared_experts_outputs", shared_output, self.layer_idx)
+            record_layer_activation_magnitude("routed_experts_outputs", final_hidden_states, self.layer_idx)
+
         if self.shared_experts is not None:
             assert shared_output is not None
             final_hidden_states += shared_output
 
-        if self.is_sequence_parallel:
-            final_hidden_states = tensor_model_parallel_all_gather(
-                final_hidden_states, 0)
-            final_hidden_states = final_hidden_states[:num_tokens]
-        elif self.tp_size > 1:
-            final_hidden_states = (
-                self.experts.maybe_all_reduce_tensor_model_parallel(
-                    final_hidden_states))
+        if not ANALYSIS_MODULE_LOADED:  # 🔍
+            if self.is_sequence_parallel:
+                final_hidden_states = tensor_model_parallel_all_gather(
+                    final_hidden_states, 0)
+                final_hidden_states = final_hidden_states[:num_tokens]
+            elif self.tp_size > 1:
+                final_hidden_states = (
+                    self.experts.maybe_all_reduce_tensor_model_parallel(
+                        final_hidden_states))
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
@@ -374,10 +390,8 @@ class DeepseekV2Attention(nn.Module):
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-        layer_idx=None,  # 🔍
     ) -> None:
         super().__init__()
-        self.layer_idx = layer_idx  # 🔍
         self.hidden_size = hidden_size
         self.qk_nope_head_dim = qk_nope_head_dim
         self.qk_rope_head_dim = qk_rope_head_dim

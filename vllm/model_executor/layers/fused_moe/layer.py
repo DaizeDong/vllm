@@ -282,6 +282,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         expert_load_view: Optional[torch.Tensor] = None,
         logical_to_physical_map: Optional[torch.Tensor] = None,
         logical_replica_count: Optional[torch.Tensor] = None,
+        layer_idx: Optional[int] = None,  # 🔍
     ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         raise NotImplementedError
 
