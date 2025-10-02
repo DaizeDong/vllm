@@ -1602,6 +1602,8 @@ class LLM:
 
         if ANALYSIS_MODULE_LOADED:  # 🔍
             assert self.llm_engine.vllm_config.parallel_config.pipeline_parallel_size == 1, "Analysis is not supported in pipeline parallelism, please set `PP=1`"
+            # TODO: support VLLM_ENABLE_V1_MULTIPROCESSING
+            assert os.getenv("VLLM_ENABLE_V1_MULTIPROCESSING", "1") == "0", "Analysis is not supported in multi-processing mode, please set `VLLM_ENABLE_V1_MULTIPROCESSING=0`"
 
         # Run the engine.
         outputs: list[Union[RequestOutput, PoolingRequestOutput]] = []
