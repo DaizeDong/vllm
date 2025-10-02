@@ -1641,11 +1641,11 @@ class LLM:
                 # Under this circumstance, the `step` function will be called only once, which means we can safely save the cache.
                 # Each `DP` worker represents `TP*PP` rank 0 and will copy itself into `TP*PP` processes (all with the same PID and rank id 0).
                 # So all the copied processes (totaling `TP*PP`) for each DP rank will enter the `save_analysis_cache` function as they all have `self.parallel_config.rank=0`.
-                print(f"[{PID}] {self.llm_engine.parallel_config.__dict__}")
-                if self.llm_engine.parallel_config.rank % self.llm_engine.parallel_config.world_size == 0:  # world_size = TP * PP
+                print(f"[{PID}] {self.llm_engine.vllm_config.parallel_config.__dict__}")
+                if self.llm_engine.vllm_config.parallel_config.rank % self.llm_engine.vllm_config.parallel_config.world_size == 0:  # world_size = TP * PP
                     save_analysis_cache()
                 else:
-                    print(f"[{PID}] Skipping analysis cache saving for rank {self.llm_engine.parallel_config.rank}")
+                    print(f"[{PID}] Skipping analysis cache saving for rank {self.llm_engine.vllm_config.parallel_config.rank}")
             else:  # 🔍 This process is the main process.
                 print(f"[{PID}] Not a Ray worker, skipping analysis cache saving.")
                 pass

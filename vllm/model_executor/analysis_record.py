@@ -10,6 +10,7 @@ try:  # 🔍
         ANALYSIS_TYPE,
         ANALYSIS_CACHE_DYNAMIC,
         ANALYSIS_CACHE_STATIC,
+        ANALYSIS_DEBUG,
     )
     ANALYSIS_MODULE_LOADED = True
 except Exception as e:
@@ -20,7 +21,8 @@ print(f"[{PID}] ANALYSIS_MODULE_LOADED: {ANALYSIS_MODULE_LOADED}")
 
 @torch._dynamo.disable
 def record_value(value_name, value):  # 🔍
-    # print(f"[{PID}] {value_name} ({value.shape})\n{value}")
+    if ANALYSIS_DEBUG:
+        print(f"[{PID}] {value_name} ({value.shape})\n{value}")
     if not analysis_utils.ANALYSIS_ENABLED:
         return
     if not ANALYSIS_CACHE_DYNAMIC or ANALYSIS_CACHE_DYNAMIC[-1] is None:
